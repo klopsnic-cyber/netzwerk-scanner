@@ -17,6 +17,12 @@ data/oui.csv
 # macOS
 .DS_Store
 
+# Generierte Icon-Artefakte (aus assets/make_icon.py beim Build)
+assets/Netzwerk-Scanner.iconset/
+assets/Netzwerk-Scanner.icns
+assets/preview.png
+assets/app_icon.png
+
 # Test-/Export-Ausgaben
 Netzwerkdoku_*.xlsx
 _test_export.xlsx

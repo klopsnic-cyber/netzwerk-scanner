@@ -239,6 +239,107 @@ def reverse_dns(ip: str) -> str:
         return ""
 
 
+# --- mDNS / Bonjour (.local-Namen) ----------------------------------------
+
+def _dns_encode_name(name: str) -> bytes:
+    out = b""
+    for label in name.split("."):
+        if label:
+            out += bytes([len(label)]) + label.encode("ascii", "ignore")
+    return out + b"\x00"
+
+
+def _dns_read_name(data: bytes, offset: int):
+    """Liest einen DNS-Namen (inkl. Kompressions-Zeiger). Gibt (name, ende)."""
+    labels = []
+    jumped = False
+    end = offset
+    for _ in range(128):  # Schutz gegen Endlosschleifen
+        if offset >= len(data):
+            break
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            if not jumped:
+                end = offset
+            break
+        if length & 0xC0 == 0xC0:  # Zeiger
+            if offset + 1 >= len(data):
+                break
+            ptr = ((length & 0x3F) << 8) | data[offset + 1]
+            if not jumped:
+                end = offset + 2
+            offset = ptr
+            jumped = True
+            continue
+        offset += 1
+        labels.append(data[offset:offset + length].decode("latin-1", "ignore"))
+        offset += length
+    return ".".join(labels), end
+
+
+def _parse_ptr(data: bytes) -> str:
+    try:
+        qdcount = int.from_bytes(data[4:6], "big")
+        ancount = int.from_bytes(data[6:8], "big")
+        offset = 12
+        for _ in range(qdcount):
+            _, offset = _dns_read_name(data, offset)
+            offset += 4
+        for _ in range(ancount):
+            _, offset = _dns_read_name(data, offset)
+            rtype = int.from_bytes(data[offset:offset + 2], "big")
+            offset += 8  # type(2)+class(2)+ttl(4)
+            rdlength = int.from_bytes(data[offset:offset + 2], "big")
+            offset += 2
+            if rtype == 12:  # PTR
+                name, _ = _dns_read_name(data, offset)
+                return name
+            offset += rdlength
+    except Exception:
+        return ""
+    return ""
+
+
+def mdns_name(ip: str, timeout: float = 1.0) -> str:
+    """Fragt den Bonjour/.local-Namen per Multicast-DNS (PTR) ab.
+
+    Findet Namen vieler Apple-, Linux- und IoT-Geräte, die kein Reverse-DNS
+    und kein NetBIOS haben.
+    """
+    try:
+        rev = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+        query = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        query += _dns_encode_name(rev)
+        query += b"\x00\x0c" + b"\x80\x01"  # QTYPE=PTR, QCLASS=IN + Unicast-Antwort
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        except Exception:
+            pass
+        s.settimeout(timeout)
+        s.sendto(query, ("224.0.0.251", 5353))
+        deadline = time.time() + timeout
+        result = ""
+        while time.time() < deadline:
+            try:
+                data, _ = s.recvfrom(2048)
+            except socket.timeout:
+                break
+            name = _parse_ptr(data)
+            if name:
+                result = name
+                break
+        s.close()
+        if result:
+            # ".local"-Suffix und Endpunkt entfernen -> kompakter Name
+            return result.rstrip(".").removesuffix(".local")
+        return ""
+    except Exception:
+        return ""
+
+
 def netbios_name(ip: str, timeout: float = 1.0) -> str:
     """Fragt den NetBIOS-Namen (NBSTAT) per UDP/137 ab – für Windows-Geräte."""
     try:
@@ -381,8 +482,10 @@ class Scanner:
             h.mac = arp.get(ip, "")
             if h.mac:
                 h.vendor = lookup_vendor(h.mac)
-            # Namen
+            # Namen: Reverse-DNS -> mDNS/Bonjour -> NetBIOS
             h.hostname = reverse_dns(ip)
+            if not h.hostname:
+                h.hostname = mdns_name(ip, cfg.ping_timeout)
             if not h.hostname:
                 nb = netbios_name(ip, cfg.ping_timeout)
                 if nb:

@@ -1,5 +1,5 @@
 """
-Tkinter-Oberfläche für den Netzwerk-Scanner.
+Tkinter-Oberfläche für den Netzwerk-Scanner – modernes, helles Theme.
 
 Der Scan läuft in einem Hintergrund-Thread; Fortschritt und Ergebnisse
 werden über eine Queue an den GUI-Thread gemeldet (Tk ist nicht
@@ -8,10 +8,14 @@ thread-sicher).
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import queue
+import subprocess
+import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
@@ -20,6 +24,18 @@ from . import exporter
 from .oui import database_size
 from .scanner import Host, ScanConfig, Scanner, guess_local_network
 
+# --- Farbpalette (modern, hell) -------------------------------------------
+BG = "#EEF1F7"        # Fensterhintergrund
+CARD = "#FFFFFF"      # Kartenflächen
+ACCENT = "#2482F9"    # Akzent (Blau, wie App-Icon)
+ACCENT_DK = "#1B5FBE"
+TEXT = "#1E2430"
+MUTED = "#6B7280"
+BORDER = "#DCE1EA"
+STRIPE = "#F3F7FE"    # Zebra-Zeile
+HEAD_BG = "#0E2A4A"   # Tabellenkopf dunkelblau
+SEL = "#CFE3FF"       # Auswahl
+
 DEPTH_LABELS = {
     "schnell": "Schnell (nur wichtigste Ports)",
     "standard": "Standard",
@@ -27,113 +43,262 @@ DEPTH_LABELS = {
 }
 DEPTH_ORDER = ["schnell", "standard", "gruendlich"]
 
+# Spalten: (key, Überschrift, Breite, Ausrichtung)
 TREE_COLUMNS = [
-    ("ip", "IP-Adresse", 120),
-    ("vendor", "Hersteller", 150),
-    ("device", "Gerätetyp", 170),
-    ("hostname", "Netzwerkname", 160),
-    ("mac", "MAC-Adresse", 140),
-    ("winfunc", "Windows-Funktion", 150),
-    ("ports", "Offene Ports", 160),
+    ("icon", "", 40, "center"),
+    ("ip", "IP-Adresse", 120, "w"),
+    ("vendor", "Hersteller", 160, "w"),
+    ("device", "Gerätetyp", 190, "w"),
+    ("hostname", "Netzwerkname", 170, "w"),
+    ("mac", "MAC-Adresse", 140, "w"),
+    ("winfunc", "Windows-Funktion", 150, "w"),
+    ("ports", "Offene Ports", 150, "w"),
 ]
+
+
+def device_emoji(device_type: str, os_hint: str = "") -> str:
+    d = (device_type or "").lower()
+    if "drucker" in d:
+        return "🖨"
+    if "nas" in d or "fileserver" in d:
+        return "🗄"
+    if "router" in d or "gateway" in d:
+        return "🌐"
+    if "voip" in d or "telefon" in d:
+        return "☎"
+    if "kartenleser" in d or "ti-" in d:
+        return "💳"
+    if "server" in d:
+        return "🖧"
+    if "virtuelle" in d:
+        return "🫙"
+    if "mac" in d:
+        return "🍎"
+    if "pc" in d or "workstation" in d or os_hint == "Windows":
+        return "🖥"
+    if "handy" in d or "phone" in d or "iphone" in d:
+        return "📱"
+    return "🔵"
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{__app_name__} {__version__}")
-        self.geometry("1080x680")
-        self.minsize(900, 560)
+        self.geometry("1120x720")
+        self.minsize(940, 600)
+        self.configure(bg=BG)
 
         self.scanner: Optional[Scanner] = None
         self.scan_thread: Optional[threading.Thread] = None
         self.hosts: List[Host] = []
-        # None = eingebaute Vorlage (in den Programmcode eingebacken).
-        self.template_path = None
+        self.template_path = None  # None = eingebaute Vorlage
         self.msg_queue: "queue.Queue" = queue.Queue()
+        self._icon_img = None
+        self._sort_state = {}
 
+        self._init_fonts()
+        self._init_style()
         self._build_ui()
+        self._set_window_icon()
         self.after(100, self._poll_queue)
 
-    # ------------------------------------------------------------------ UI
-    def _build_ui(self):
-        pad = {"padx": 8, "pady": 4}
-        style = ttk.Style(self)
-        try:
-            style.theme_use("aqua")  # nativer Look auf macOS
-        except tk.TclError:
-            pass
+    # ------------------------------------------------------------- Styling
+    def _init_fonts(self):
+        family = "Helvetica Neue"
+        avail = set(tkfont.families())
+        if family not in avail:
+            family = "Helvetica" if "Helvetica" in avail else "TkDefaultFont"
+        self.f_base = tkfont.Font(family=family, size=13)
+        self.f_small = tkfont.Font(family=family, size=11)
+        self.f_bold = tkfont.Font(family=family, size=13, weight="bold")
+        self.f_title = tkfont.Font(family=family, size=20, weight="bold")
+        self.f_sub = tkfont.Font(family=family, size=12)
+        self.f_row = tkfont.Font(family=family, size=12)
+        self.f_head = tkfont.Font(family=family, size=12, weight="bold")
 
-        # --- Kopfdaten -------------------------------------------------
-        top = ttk.LabelFrame(self, text="Kundendaten (optional)")
-        top.pack(fill="x", **pad)
+    def _init_style(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")  # voll gestaltbar (im Gegensatz zu 'aqua')
+
+        style.configure(".", background=BG, foreground=TEXT, font=self.f_base)
+        style.configure("TFrame", background=BG)
+        style.configure("Card.TFrame", background=CARD)
+        style.configure("TLabel", background=CARD, foreground=TEXT, font=self.f_base)
+        style.configure("Win.TLabel", background=BG, foreground=TEXT)
+        style.configure("Muted.TLabel", background=CARD, foreground=MUTED, font=self.f_small)
+        style.configure("CardTitle.TLabel", background=CARD, foreground=ACCENT_DK,
+                        font=self.f_bold)
+        style.configure("Accentval.TLabel", background=CARD, foreground=ACCENT,
+                        font=self.f_bold)
+
+        # Eingaben
+        style.configure("TEntry", fieldbackground="#FBFCFE", bordercolor=BORDER,
+                        relief="flat", padding=5)
+        style.configure("TCombobox", fieldbackground="#FBFCFE", bordercolor=BORDER,
+                        padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", "#FBFCFE")])
+
+        # Buttons
+        style.configure("TButton", background="#E7ECF4", foreground=TEXT,
+                        bordercolor=BORDER, relief="flat",
+                        padding=(12, 6), font=self.f_base)
+        style.map("TButton",
+                  background=[("active", "#D8E0EC"), ("disabled", "#EFF1F5")],
+                  foreground=[("disabled", "#A6ADBB")])
+        style.configure("Accent.TButton", background=ACCENT, foreground="#FFFFFF",
+                        bordercolor=ACCENT, padding=(16, 7), font=self.f_bold)
+        style.map("Accent.TButton",
+                  background=[("active", ACCENT_DK), ("disabled", "#A9C6F2")],
+                  foreground=[("disabled", "#EAF1FC")])
+        style.configure("Link.TButton", background=CARD, foreground=ACCENT,
+                        relief="flat", padding=(6, 4), font=self.f_small)
+        style.map("Link.TButton", background=[("active", "#EEF4FF")])
+
+        # Fortschritt
+        style.configure("Accent.Horizontal.TProgressbar", troughcolor="#E3E8F0",
+                        background=ACCENT, bordercolor="#E3E8F0", lightcolor=ACCENT,
+                        darkcolor=ACCENT, thickness=10)
+
+        # Tabelle
+        style.configure("Treeview", background=CARD, fieldbackground=CARD,
+                        foreground=TEXT, rowheight=30, font=self.f_row,
+                        bordercolor=BORDER, borderwidth=0)
+        style.map("Treeview", background=[("selected", SEL)],
+                  foreground=[("selected", TEXT)])
+        style.configure("Treeview.Heading", background=HEAD_BG, foreground="#FFFFFF",
+                        font=self.f_head, relief="flat", padding=6)
+        style.map("Treeview.Heading", background=[("active", "#1C3F66")])
+
+    def _set_window_icon(self):
+        for base in (getattr(sys, "_MEIPASS", None),
+                     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+            if not base:
+                continue
+            p = os.path.join(base, "assets", "app_icon.png")
+            if os.path.exists(p):
+                try:
+                    self._icon_img = tk.PhotoImage(file=p)
+                    self.iconphoto(True, self._icon_img)
+                    return
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------ UI
+    def _card(self, parent, pad=14):
+        """Weiße Karte mit dünnem Rahmen als Container."""
+        outer = tk.Frame(parent, bg=BORDER)
+        inner = tk.Frame(outer, bg=CARD)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        body = tk.Frame(inner, bg=CARD)
+        body.pack(fill="both", expand=True, padx=pad, pady=pad)
+        return outer, body
+
+    def _build_ui(self):
+        # --- Kopfbanner ------------------------------------------------
+        header = tk.Frame(self, bg=ACCENT, height=64)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text="Netzwerk-Scanner", bg=ACCENT, fg="#FFFFFF",
+                 font=self.f_title).pack(side="left", padx=20)
+        tk.Label(header, text="Netzwerkdoku automatisch erfassen",
+                 bg=ACCENT, fg="#DCEBFF", font=self.f_sub).pack(side="left", padx=4)
+        self.hdr_count = tk.Label(header, text="", bg=ACCENT, fg="#FFFFFF",
+                                  font=self.f_bold)
+        self.hdr_count.pack(side="right", padx=20)
+
+        wrap = tk.Frame(self, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=14, pady=12)
+
+        # --- Kundendaten ----------------------------------------------
+        c1, b1 = self._card(wrap)
+        c1.pack(fill="x", pady=(0, 10))
+        ttk.Label(b1, text="Kundendaten (optional)", style="CardTitle.TLabel").grid(
+            row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
         self.var_kunde = tk.StringVar()
         self.var_kundennr = tk.StringVar()
         self.var_datum = tk.StringVar()
-        ttk.Label(top, text="Kundenname:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        ttk.Entry(top, textvariable=self.var_kunde, width=28).grid(row=0, column=1, padx=4)
-        ttk.Label(top, text="Tomedo Kundennr.:").grid(row=0, column=2, sticky="e", padx=4)
-        ttk.Entry(top, textvariable=self.var_kundennr, width=18).grid(row=0, column=3, padx=4)
-        ttk.Label(top, text="Installationsdatum:").grid(row=0, column=4, sticky="e", padx=4)
-        ttk.Entry(top, textvariable=self.var_datum, width=14).grid(row=0, column=5, padx=4)
+        ttk.Label(b1, text="Kundenname").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(b1, textvariable=self.var_kunde, width=26).grid(row=1, column=1, padx=(0, 16))
+        ttk.Label(b1, text="Tomedo Kundennr.").grid(row=1, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(b1, textvariable=self.var_kundennr, width=16).grid(row=1, column=3, padx=(0, 16))
+        ttk.Label(b1, text="Installationsdatum").grid(row=1, column=4, sticky="w", padx=(0, 6))
+        ttk.Entry(b1, textvariable=self.var_datum, width=14).grid(row=1, column=5)
 
         # --- Scan-Einstellungen ---------------------------------------
-        cfg = ttk.LabelFrame(self, text="Scan")
-        cfg.pack(fill="x", **pad)
-        ttk.Label(cfg, text="Netzbereich (CIDR):").grid(row=0, column=0, sticky="e", padx=4, pady=6)
+        c2, b2 = self._card(wrap)
+        c2.pack(fill="x", pady=(0, 10))
+        ttk.Label(b2, text="Scan", style="CardTitle.TLabel").grid(
+            row=0, column=0, columnspan=8, sticky="w", pady=(0, 8))
+        ttk.Label(b2, text="Netzbereich (CIDR)").grid(row=1, column=0, sticky="w", padx=(0, 6))
         self.var_cidr = tk.StringVar(value=guess_local_network())
-        ttk.Entry(cfg, textvariable=self.var_cidr, width=22).grid(row=0, column=1, padx=4)
-        ttk.Button(cfg, text="Erkennen", command=self._detect_net).grid(row=0, column=2, padx=4)
-
-        ttk.Label(cfg, text="Tiefe:").grid(row=0, column=3, sticky="e", padx=4)
+        ttk.Entry(b2, textvariable=self.var_cidr, width=20).grid(row=1, column=1, padx=(0, 6))
+        ttk.Button(b2, text="Erkennen", command=self._detect_net).grid(row=1, column=2, padx=(0, 16))
+        ttk.Label(b2, text="Tiefe").grid(row=1, column=3, sticky="w", padx=(0, 6))
         self.var_depth = tk.StringVar(value=DEPTH_LABELS["gruendlich"])
-        depth_box = ttk.Combobox(cfg, textvariable=self.var_depth, state="readonly",
-                                 values=[DEPTH_LABELS[d] for d in DEPTH_ORDER], width=30)
-        depth_box.grid(row=0, column=4, padx=4)
+        ttk.Combobox(b2, textvariable=self.var_depth, state="readonly",
+                     values=[DEPTH_LABELS[d] for d in DEPTH_ORDER], width=30).grid(
+            row=1, column=4, padx=(0, 16))
+        self.btn_scan = ttk.Button(b2, text="Scan starten", style="Accent.TButton",
+                                   command=self._start_scan)
+        self.btn_scan.grid(row=1, column=5, padx=(0, 6))
+        self.btn_cancel = ttk.Button(b2, text="Abbrechen", command=self._cancel_scan,
+                                     state="disabled")
+        self.btn_cancel.grid(row=1, column=6)
 
-        self.btn_scan = ttk.Button(cfg, text="Scan starten", command=self._start_scan)
-        self.btn_scan.grid(row=0, column=5, padx=8)
-        self.btn_cancel = ttk.Button(cfg, text="Abbrechen", command=self._cancel_scan, state="disabled")
-        self.btn_cancel.grid(row=0, column=6, padx=4)
-
-        # --- Vorlage ---------------------------------------------------
-        tpl = ttk.Frame(self)
-        tpl.pack(fill="x", **pad)
-        ttk.Label(tpl, text="Excel-Vorlage:").pack(side="left", padx=4)
+        # Vorlage-Zeile
+        ttk.Label(b2, text="Excel-Vorlage").grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.var_tpl = tk.StringVar(value="Netzwerkdoku-Vorlage (eingebaut)")
-        ttk.Label(tpl, textvariable=self.var_tpl, foreground="#3366aa").pack(side="left", padx=4)
-        ttk.Button(tpl, text="Andere Vorlage wählen …", command=self._pick_template).pack(side="left", padx=8)
-        ttk.Button(tpl, text="Zurück zur eingebauten", command=self._reset_template).pack(side="left", padx=2)
+        ttk.Label(b2, textvariable=self.var_tpl, style="Accentval.TLabel").grid(
+            row=2, column=1, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Button(b2, text="Andere wählen …", style="Link.TButton",
+                   command=self._pick_template).grid(row=2, column=3, sticky="w", pady=(10, 0))
+        ttk.Button(b2, text="Zurück zur eingebauten", style="Link.TButton",
+                   command=self._reset_template).grid(row=2, column=4, sticky="w", pady=(10, 0))
 
         # --- Fortschritt ----------------------------------------------
-        prog = ttk.Frame(self)
-        prog.pack(fill="x", **pad)
-        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=1.0)
-        self.progress.pack(side="left", fill="x", expand=True, padx=4)
-        self.var_status = tk.StringVar(value=f"Bereit – OUI-Datenbank: {database_size()} Hersteller.")
-        ttk.Label(prog, textvariable=self.var_status, width=48, anchor="w").pack(side="left", padx=8)
+        prog = tk.Frame(wrap, bg=BG)
+        prog.pack(fill="x", pady=(0, 8))
+        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=1.0,
+                                        style="Accent.Horizontal.TProgressbar")
+        self.progress.pack(side="left", fill="x", expand=True)
+        self.var_status = tk.StringVar(value=f"Bereit · OUI-Datenbank: {database_size()} Hersteller")
+        tk.Label(prog, textvariable=self.var_status, bg=BG, fg=MUTED,
+                 font=self.f_small, anchor="w", width=52).pack(side="left", padx=12)
 
         # --- Ergebnis-Tabelle -----------------------------------------
-        table_frame = ttk.Frame(self)
-        table_frame.pack(fill="both", expand=True, **pad)
+        c3, b3 = self._card(wrap, pad=1)
+        c3.pack(fill="both", expand=True)
         cols = [c[0] for c in TREE_COLUMNS]
-        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings")
-        for key, label, width in TREE_COLUMNS:
-            self.tree.heading(key, text=label)
-            self.tree.column(key, width=width, anchor="w")
-        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree = ttk.Treeview(b3, columns=cols, show="headings", selectmode="browse")
+        for key, label, width, anchor in TREE_COLUMNS:
+            if key == "icon":
+                self.tree.heading(key, text=label)
+            else:
+                self.tree.heading(key, text=label, command=lambda k=key: self._sort_by(k))
+            self.tree.column(key, width=width, anchor=anchor,
+                             stretch=(key in ("device", "hostname", "vendor")))
+        self.tree.tag_configure("odd", background=CARD)
+        self.tree.tag_configure("even", background=STRIPE)
+        vsb = ttk.Scrollbar(b3, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", self._on_double_click)
 
         # --- Aktionen --------------------------------------------------
-        actions = ttk.Frame(self)
-        actions.pack(fill="x", **pad)
+        actions = tk.Frame(wrap, bg=BG)
+        actions.pack(fill="x", pady=(10, 0))
         self.var_count = tk.StringVar(value="0 Geräte")
-        ttk.Label(actions, textvariable=self.var_count).pack(side="left", padx=4)
+        tk.Label(actions, textvariable=self.var_count, bg=BG, fg=TEXT,
+                 font=self.f_bold).pack(side="left")
+        self.var_summary = tk.StringVar(value="")
+        tk.Label(actions, textvariable=self.var_summary, bg=BG, fg=MUTED,
+                 font=self.f_small).pack(side="left", padx=12)
         self.btn_export = ttk.Button(actions, text="In Excel exportieren …",
-                                     command=self._export, state="disabled")
-        self.btn_export.pack(side="right", padx=4)
+                                     style="Accent.TButton", command=self._export,
+                                     state="disabled")
+        self.btn_export.pack(side="right")
 
     # ------------------------------------------------------------- Aktionen
     def _detect_net(self):
@@ -163,7 +328,6 @@ class App(tk.Tk):
             return
         cidr = self.var_cidr.get().strip()
         try:
-            import ipaddress
             ipaddress.ip_network(cidr, strict=False)
         except ValueError:
             messagebox.showerror("Ungültiger Netzbereich",
@@ -171,9 +335,9 @@ class App(tk.Tk):
             return
 
         self.hosts = []
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        self.tree.delete(*self.tree.get_children())
         self.var_count.set("0 Geräte")
+        self.var_summary.set("")
         self.btn_scan.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.btn_export.config(state="disabled")
@@ -182,12 +346,11 @@ class App(tk.Tk):
         self.scanner = Scanner(ScanConfig(depth=self._current_depth()))
 
         def worker():
-            def prog(frac, msg):
-                self.msg_queue.put(("progress", frac, msg))
-            def on_host(h):
-                self.msg_queue.put(("host", h))
             try:
-                result = self.scanner.scan(cidr, progress=prog, on_host=on_host)
+                result = self.scanner.scan(
+                    cidr,
+                    progress=lambda f, m: self.msg_queue.put(("progress", f, m)),
+                    on_host=lambda h: self.msg_queue.put(("host", h)))
                 self.msg_queue.put(("done", result))
             except Exception as e:  # pragma: no cover
                 self.msg_queue.put(("error", str(e)))
@@ -218,19 +381,66 @@ class App(tk.Tk):
             messagebox.showerror("Export fehlgeschlagen", str(e))
             return
         if messagebox.askyesno("Fertig",
-                               f"Gespeichert:\n{path}\n\nOrdner im Finder öffnen?"):
+                               f"Gespeichert:\n{path}\n\nIm Finder anzeigen?"):
             try:
-                import subprocess
                 subprocess.run(["open", "-R", path])
             except Exception:
                 pass
 
-    # ------------------------------------------------------------- Queue
-    def _add_host_row(self, h: Host):
+    # ------------------------------------------------------- Tabelle/Events
+    def _row_values(self, h: Host):
         ports = ", ".join(str(p) for p in sorted(h.open_ports))
-        self.tree.insert("", "end", values=(
-            h.ip, h.vendor, h.device_type, h.hostname, h.mac, h.win_function, ports))
+        return (device_emoji(h.device_type, h.os_hint), h.ip, h.vendor,
+                h.device_type, h.hostname, h.mac, h.win_function, ports)
 
+    def _add_host_row(self, h: Host):
+        tag = "even" if len(self.tree.get_children()) % 2 else "odd"
+        self.tree.insert("", "end", values=self._row_values(h), tags=(tag,))
+
+    def _restripe(self):
+        for i, item in enumerate(self.tree.get_children()):
+            self.tree.item(item, tags=("even" if i % 2 else "odd",))
+
+    def _sort_by(self, key):
+        idx = [c[0] for c in TREE_COLUMNS].index(key)
+        reverse = self._sort_state.get(key, False)
+
+        def sort_key(h):
+            v = self._row_values(h)[idx]
+            if key == "ip":
+                try:
+                    return (0, int(ipaddress.ip_address(h.ip)))
+                except ValueError:
+                    return (1, 0)
+            return (str(v) == "", str(v).lower())
+
+        self.hosts.sort(key=sort_key, reverse=reverse)
+        self._sort_state[key] = not reverse
+        self.tree.delete(*self.tree.get_children())
+        for h in self.hosts:
+            self._add_host_row(h)
+
+    def _on_double_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        vals = self.tree.item(item, "values")
+        ip = vals[1]
+        ports = vals[7]
+        scheme = "https" if "443" in ports else "http"
+        if any(p in ports for p in ("80", "443", "8080", "8443")):
+            try:
+                subprocess.run(["open", f"{scheme}://{ip}"])
+            except Exception:
+                pass
+
+    def _update_summary(self):
+        from collections import Counter
+        c = Counter(h.device_type or "Unbekannt" for h in self.hosts)
+        top = ", ".join(f"{v}× {k}" for k, v in c.most_common(4))
+        self.var_summary.set(top)
+
+    # ------------------------------------------------------------- Queue
     def _poll_queue(self):
         try:
             while True:
@@ -245,6 +455,7 @@ class App(tk.Tk):
                     self.hosts.append(h)
                     self._add_host_row(h)
                     self.var_count.set(f"{len(self.hosts)} Geräte")
+                    self.hdr_count.config(text=f"{len(self.hosts)} Geräte")
                 elif kind == "done":
                     self.hosts = item[1] or self.hosts
                     self._finish_scan()
@@ -260,7 +471,10 @@ class App(tk.Tk):
         self.btn_cancel.config(state="disabled")
         if self.hosts:
             self.btn_export.config(state="normal")
-        self.var_count.set(f"{len(self.hosts)} Geräte")
+        n = len(self.hosts)
+        self.var_count.set(f"{n} Geräte")
+        self.hdr_count.config(text=f"{n} Geräte")
+        self._update_summary()
 
 
 def main():

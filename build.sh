@@ -12,7 +12,7 @@ APP_NAME="Netzwerk-Scanner"
 DMG_NAME="Netzwerk-Scanner.dmg"
 VENV=".venv"
 
-echo "==> 1/5  Python-Umgebung vorbereiten"
+echo "==> 1/6  Python-Umgebung vorbereiten"
 
 # Ein Python mit modernem Tk 8.6 finden. Apples System-Python (3.9 unter
 # /Library/Developer/CommandLineTools) nutzt das defekte Tk 8.5 und erzeugt
@@ -57,7 +57,7 @@ source "$VENV/bin/activate"
 pip install --upgrade pip >/dev/null
 pip install -r requirements.txt
 
-echo "==> 2/5  OUI-Herstellerdatenbank laden (für Offline-Betrieb)"
+echo "==> 2/6  OUI-Herstellerdatenbank laden (für Offline-Betrieb)"
 mkdir -p data
 if [ ! -s data/oui.csv ]; then
   # Offizielle IEEE-Liste; bei Fehlschlag greift die eingebaute Fallback-Liste.
@@ -71,11 +71,20 @@ else
   echo "    data/oui.csv bereits vorhanden."
 fi
 
-echo "==> 3/5  App mit PyInstaller bauen"
+echo "==> 3/6  App-Icon erzeugen"
+pip install pillow >/dev/null 2>&1 || true
+python assets/make_icon.py assets/ || echo "    (Icon übersprungen)"
+if [ -d assets/Netzwerk-Scanner.iconset ]; then
+  iconutil -c icns assets/Netzwerk-Scanner.iconset -o assets/Netzwerk-Scanner.icns \
+    && echo "    assets/Netzwerk-Scanner.icns erstellt." \
+    || echo "    WARNUNG: iconutil fehlgeschlagen – App wird ohne eigenes Icon gebaut."
+fi
+
+echo "==> 4/6  App mit PyInstaller bauen"
 rm -rf build dist
 pyinstaller --noconfirm NetzwerkScanner.spec
 
-echo "==> 4/5  .dmg erstellen"
+echo "==> 5/6  .dmg erstellen"
 rm -f "$DMG_NAME"
 if command -v create-dmg >/dev/null 2>&1; then
   create-dmg \
@@ -96,7 +105,7 @@ else
     -ov -format UDZO "$DMG_NAME"
 fi
 
-echo "==> 5/5  Fertig"
+echo "==> 6/6  Fertig"
 echo "    App:  dist/$APP_NAME.app"
 echo "    DMG:  $DMG_NAME"
 echo

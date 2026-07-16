@@ -7,10 +7,18 @@ Ergebnis: dist/Netzwerk-Scanner.app
 
 block_cipher = None
 
+import os as _os
+
 datas = [
     ("data/Netzwerkdoku-Vorlage.xlsx", "data"),
     ("data/oui.csv", "data"),
 ]
+# Fenster-Symbol (für laufende App) mitnehmen, falls erzeugt.
+if _os.path.exists("assets/app_icon.png"):
+    datas.append(("assets/app_icon.png", "assets"))
+
+# App-Icon (.icns), falls von build.sh erzeugt.
+_ICON = "assets/Netzwerk-Scanner.icns" if _os.path.exists("assets/Netzwerk-Scanner.icns") else None
 
 a = Analysis(
     ["app.py"],
@@ -61,7 +69,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Netzwerk-Scanner.app",
-    icon=None,
+    icon=_ICON,
     bundle_identifier="de.tomedo.netzwerkscanner",
     info_plist={
         "CFBundleName": "Netzwerk-Scanner",

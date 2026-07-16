@@ -5,6 +5,13 @@ gefundenen Geräte automatisch in die Excel-Vorlage `Netzwerkdoku-Vorlage.xlsx`
 einträgt. Felder, die sich technisch nicht ermitteln lassen, bleiben leer und
 werden von Hand ergänzt.
 
+Merkmale: modernes Oberflächen-Theme mit eigenem App-Icon und Gerätetyp-Symbolen,
+aktive Erreichbarkeitsprüfung (nur Geräte, die zur Scan-Zeit antworten – kein
+veralteter ARP-Cache, funktioniert auch netzübergreifend), Namensauflösung per
+Reverse-DNS, mDNS/Bonjour und NetBIOS, sortierbare Tabelle, Doppelklick öffnet
+die Web-Oberfläche eines Geräts, und die Excel-Vorlage ist fest eingebaut
+(keine externe Datei nötig).
+
 ## Was der Scanner automatisch füllt
 
 | Spalte | Automatisch? | Quelle |
