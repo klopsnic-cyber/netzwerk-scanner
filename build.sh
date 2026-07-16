@@ -115,6 +115,16 @@ echo "==> 4/6  App mit PyInstaller bauen"
 rm -rf build dist
 pyinstaller --noconfirm NetzwerkScanner.spec
 
+# App-Bundle neu versiegeln (OHNE --deep: das scheitert an Tcl-Datenordnern).
+# PyInstaller hat die inneren Binärdateien bereits ad-hoc signiert; hier wird
+# nur die äußere Bundle-Signatur konsistent gemacht. Auf Apple Silicon MUSS
+# die Signatur gültig sein, sonst laden Bausteine wie _struct nicht.
+echo "    App ad-hoc signieren …"
+codesign --force --sign - "dist/$APP_NAME.app" \
+  && echo "    Signatur ok." \
+  || echo "    WARNUNG: Signieren fehlgeschlagen (PyInstaller-Signatur bleibt)."
+codesign --verify --verbose=1 "dist/$APP_NAME.app" 2>&1 | sed 's/^/    /' || true
+
 echo "==> 5/6  .dmg erstellen"
 rm -f "$DMG_NAME"
 if command -v create-dmg >/dev/null 2>&1; then
