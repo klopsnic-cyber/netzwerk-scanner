@@ -39,7 +39,7 @@ COLUMN_MAP = {
     9:  lambda h: "",                                     # angebunden an (manuell)
     10: lambda h: h.win_function,                         # Windows Funktion
     11: lambda h: _ports_summary(h),                     # Sonstiges -> offene Ports
-    12: lambda h: h.software,                             # Softwarestand
+    12: lambda h: "",                                     # Softwarestand (manuell, bleibt leer)
     13: lambda h: "",                                     # eingerichtet von (manuell)
 }
 

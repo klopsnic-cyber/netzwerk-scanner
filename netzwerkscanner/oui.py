@@ -86,6 +86,16 @@ def _load() -> Dict[str, str]:
     if _CACHE is not None:
         return _CACHE
     table: Dict[str, str] = dict(_FALLBACK)
+
+    # 1) Fest eingebettete, vollständige IEEE-Liste (immer verfügbar, offline,
+    #    überlebt jede Weitergabe). Das ist die Hauptquelle.
+    try:
+        from . import oui_data
+        table.update(oui_data.load())
+    except Exception:
+        pass
+
+    # 2) Optionale externe data/oui.csv (z.B. aktuellere Liste) überschreibt.
     path = _oui_path()
     if os.path.exists(path):
         try:

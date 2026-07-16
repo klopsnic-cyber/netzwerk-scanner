@@ -88,18 +88,14 @@ source "$VENV/bin/activate"
 pip install --upgrade pip >/dev/null
 pip install -r requirements.txt
 
-echo "==> 2/6  OUI-Herstellerdatenbank laden (für Offline-Betrieb)"
+echo "==> 2/6  OUI-Herstellerliste aktualisieren (fest eingebettet)"
 mkdir -p data
-if [ ! -s data/oui.csv ]; then
-  # Offizielle IEEE-Liste; bei Fehlschlag greift die eingebaute Fallback-Liste.
-  if curl -fsSL --retry 3 -o data/oui.csv "https://standards-oui.ieee.org/oui/oui.csv"; then
-    echo "    OUI-Datenbank geladen ($(wc -l < data/oui.csv) Zeilen)."
-  else
-    echo "    WARNUNG: OUI-Download fehlgeschlagen – Fallback-Liste wird genutzt."
-    printf 'Registry,Assignment,Organization Name,Organization Address\n' > data/oui.csv
-  fi
+# Offizielle IEEE-Liste laden (nur um die eingebettete Liste zu aktualisieren).
+if curl -fsSL --retry 3 -o data/oui.csv "https://standards-oui.ieee.org/oui/oui.csv"; then
+  echo "    IEEE-Liste geladen ($(wc -l < data/oui.csv) Zeilen)."
+  python assets/make_oui_data.py || echo "    (Einbettung übersprungen)"
 else
-  echo "    data/oui.csv bereits vorhanden."
+  echo "    Kein Download möglich – vorhandene eingebettete Liste wird verwendet."
 fi
 
 echo "==> 3/6  App-Icon erzeugen"

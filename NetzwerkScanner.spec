@@ -11,7 +11,8 @@ import os as _os
 
 datas = [
     ("data/Netzwerkdoku-Vorlage.xlsx", "data"),
-    ("data/oui.csv", "data"),
+    # Die IEEE-OUI-Liste ist fest in netzwerkscanner/oui_data.py eingebettet
+    # und muss nicht separat gebündelt werden.
 ]
 # Fenster-Symbol (für laufende App) mitnehmen, falls erzeugt.
 if _os.path.exists("assets/app_icon.png"):
