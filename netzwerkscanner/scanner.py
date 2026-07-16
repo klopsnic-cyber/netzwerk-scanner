@@ -16,6 +16,7 @@ benutzt, damit das Bündeln mit PyInstaller einfach bleibt.
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import ipaddress
 import platform
 import re
@@ -150,6 +151,44 @@ def ping(ip: str, timeout: float = 1.0) -> bool:
         return res.returncode == 0
     except Exception:
         return False
+
+
+# Ports für die aktive Erreichbarkeitsprüfung, falls ein Gerät Ping blockt.
+# Ein offener ODER aktiv abgelehnter Port beweist, dass der Host JETZT online
+# ist. Funktioniert auch netzübergreifend (über Router), anders als ARP.
+LIVENESS_PORTS = (
+    80, 443, 22, 445, 139, 135, 3389,  # Web, SSH, Windows/SMB/RDP
+    62078,                             # iPhone (lockdownd)
+    548, 5000,                         # Apple (AFP/AirPlay)
+    9100, 631, 515,                    # Drucker
+    53, 8080,                          # Gateway/DNS, Web-Alt
+)
+
+
+def tcp_reachable(ip: str, timeout: float = 0.5, ports=LIVENESS_PORTS) -> bool:
+    """True, wenn der Host auf mind. einem TCP-Port jetzt reagiert
+    (Verbindung offen oder aktiv abgelehnt = Host lebt gerade)."""
+    for port in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            rc = s.connect_ex((ip, port))
+            if rc == 0 or rc == errno.ECONNREFUSED:
+                return True
+        except Exception:
+            pass
+        finally:
+            s.close()
+    return False
+
+
+def probe(ip: str, timeout: float = 1.0) -> bool:
+    """Ist der Host JETZT aktiv erreichbar? Erst Ping (auch subnetzübergreifend),
+    dann als Rückfall ein aktiver TCP-Kontakt. Keine ARP-Cache-Auswertung –
+    es werden nur Geräte gemeldet, die zur Scan-Zeit tatsächlich antworten."""
+    if ping(ip, timeout):
+        return True
+    return tcp_reachable(ip, min(timeout, 0.5))
 
 
 # ---------------------------------------------------------------------------
@@ -296,11 +335,14 @@ class Scanner:
         total = len(targets)
         self._report(progress, 0.0, f"Starte Ping-Sweep über {total} Adressen …")
 
-        # --- Phase 1: Ping-Sweep (parallel) -------------------------------
+        # --- Phase 1: Aktive Erreichbarkeitsprüfung (parallel) ------------
+        # Als "lebend" gilt NUR, wer zur Scan-Zeit aktiv antwortet:
+        # Ping ODER offener/abgelehnter TCP-Port. Keine (evtl. veralteten)
+        # ARP-Cache-Einträge. Funktioniert auch netzübergreifend über Router.
         alive: List[str] = []
         done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.max_workers) as ex:
-            futures = {ex.submit(ping, ip, cfg.ping_timeout): ip for ip in targets}
+            futures = {ex.submit(probe, ip, cfg.ping_timeout): ip for ip in targets}
             for fut in concurrent.futures.as_completed(futures):
                 if self._cancel.is_set():
                     break
@@ -312,18 +354,21 @@ class Scanner:
                 except Exception:
                     pass
                 self._report(progress, 0.4 * done / max(total, 1),
-                             f"Ping {done}/{total} – {len(alive)} Geräte gefunden")
+                             f"Prüfe {done}/{total} – {len(alive)} erreichbar")
 
         if self._cancel.is_set():
             return []
 
-        # ARP-Tabelle ist nach dem Ping-Sweep gefüllt.
+        # ARP-Tabelle NUR zur MAC-/Hersteller-Zuordnung der erreichbaren Geräte
+        # (nur im selben Subnetz verfügbar; sonst bleibt die MAC leer).
         arp = read_arp_table()
+
         # Eigene IP immer aufnehmen
         own = get_local_ip()
         if own not in alive and own in targets:
             alive.append(own)
         alive = sorted(set(alive), key=lambda x: int(ipaddress.ip_address(x)))
+        self._report(progress, 0.4, f"{len(alive)} Geräte erreichbar – ermittle Details …")
 
         # --- Phase 2: Details je Host (parallel) --------------------------
         hosts: List[Host] = []

@@ -13,8 +13,44 @@ DMG_NAME="Netzwerk-Scanner.dmg"
 VENV=".venv"
 
 echo "==> 1/5  Python-Umgebung vorbereiten"
+
+# Ein Python mit modernem Tk 8.6 finden. Apples System-Python (3.9 unter
+# /Library/Developer/CommandLineTools) nutzt das defekte Tk 8.5 und erzeugt
+# leere Fenster -> deshalb bevorzugen wir Homebrew-Python.
+pick_python() {
+  local cand ver
+  for cand in \
+      /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 \
+      /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3 \
+      /usr/local/bin/python3 \
+      python3.13 python3.12 python3.11 python3; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    ver=$("$cand" -c 'import tkinter; print(tkinter.TkVersion)' 2>/dev/null) || continue
+    # Tk >= 8.6 akzeptieren (8.5 ist Apples defektes System-Tk)
+    if [ "$(printf '%s\n8.6\n' "$ver" | sort -V | head -1)" = "8.6" ]; then
+      echo "$cand"; return 0
+    fi
+  done
+  return 1
+}
+
+PYBIN="$(pick_python || true)"
+if [ -z "${PYBIN:-}" ]; then
+  echo "    FEHLER: Kein Python mit funktionierendem Tk 8.6 gefunden."
+  echo "    Bitte einmalig ausführen:  brew install python-tk"
+  echo "    (installiert Homebrew-Python samt Tk 8.6) und danach ./build.sh erneut."
+  exit 1
+fi
+TKVER=$("$PYBIN" -c 'import tkinter; print(tkinter.TkVersion)')
+echo "    Python: $PYBIN  (Tk $TKVER)"
+
+# Falls eine alte Umgebung mit dem falschen (System-)Python existiert: neu bauen.
+if [ -d "$VENV" ] && ! "$VENV/bin/python" -c 'import tkinter; assert tkinter.TkVersion>=8.6' >/dev/null 2>&1; then
+  echo "    Alte Umgebung nutzt defektes Tk -> wird neu erstellt."
+  rm -rf "$VENV"
+fi
 if [ ! -d "$VENV" ]; then
-  python3 -m venv "$VENV"
+  "$PYBIN" -m venv "$VENV"
 fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"

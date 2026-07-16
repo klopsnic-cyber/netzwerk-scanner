@@ -8,7 +8,9 @@ die der Scanner nicht ermitteln kann, bleiben leer.
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
+import io
 import os
 import sys
 from copy import copy
@@ -18,6 +20,7 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Side
 
 from .scanner import Host
+from .template_data import TEMPLATE_B64
 
 # Spaltenreihenfolge der Vorlage (Zeile 5).
 HEADER_ROW = 5
@@ -47,14 +50,23 @@ def _ports_summary(h: Host) -> str:
     return "Offene Ports: " + ", ".join(str(p) for p in sorted(h.open_ports))
 
 
-def _resource_dir() -> str:
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return sys._MEIPASS  # type: ignore[attr-defined]
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Kennzeichnung für die fest eingebaute Vorlage (kein externer Pfad nötig).
+EMBEDDED = "(eingebaut)"
 
 
 def default_template_path() -> str:
-    return os.path.join(_resource_dir(), "data", "Netzwerkdoku-Vorlage.xlsx")
+    """Standard ist die in den Programmcode eingebettete Vorlage."""
+    return EMBEDDED
+
+
+def _load_template_workbook(template_path: Optional[str]):
+    """Lädt die Vorlage: eingebettete Version (Standard) oder eine vom
+    Benutzer gewählte externe .xlsx-Datei."""
+    if template_path and template_path != EMBEDDED and os.path.exists(template_path):
+        return openpyxl.load_workbook(template_path)
+    # Eingebettete Vorlage aus dem Code – immer verfügbar, ohne Zusatzdatei.
+    data = base64.b64decode(TEMPLATE_B64)
+    return openpyxl.load_workbook(io.BytesIO(data))
 
 
 def export(hosts: List[Host], out_path: str,
@@ -62,8 +74,7 @@ def export(hosts: List[Host], out_path: str,
            kundenname: str = "", kundennummer: str = "",
            installationsdatum: str = "") -> str:
     """Füllt die Vorlage und speichert sie unter out_path. Gibt out_path zurück."""
-    template_path = template_path or default_template_path()
-    wb = openpyxl.load_workbook(template_path)
+    wb = _load_template_workbook(template_path)
     ws = wb.active
 
     # Kopfdaten (unter den Labels in Zeile 1 -> Zeile 2)

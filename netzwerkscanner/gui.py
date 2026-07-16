@@ -48,7 +48,8 @@ class App(tk.Tk):
         self.scanner: Optional[Scanner] = None
         self.scan_thread: Optional[threading.Thread] = None
         self.hosts: List[Host] = []
-        self.template_path = exporter.default_template_path()
+        # None = eingebaute Vorlage (in den Programmcode eingebacken).
+        self.template_path = None
         self.msg_queue: "queue.Queue" = queue.Queue()
 
         self._build_ui()
@@ -99,9 +100,10 @@ class App(tk.Tk):
         tpl = ttk.Frame(self)
         tpl.pack(fill="x", **pad)
         ttk.Label(tpl, text="Excel-Vorlage:").pack(side="left", padx=4)
-        self.var_tpl = tk.StringVar(value=os.path.basename(self.template_path))
+        self.var_tpl = tk.StringVar(value="Netzwerkdoku-Vorlage (eingebaut)")
         ttk.Label(tpl, textvariable=self.var_tpl, foreground="#3366aa").pack(side="left", padx=4)
         ttk.Button(tpl, text="Andere Vorlage wählen …", command=self._pick_template).pack(side="left", padx=8)
+        ttk.Button(tpl, text="Zurück zur eingebauten", command=self._reset_template).pack(side="left", padx=2)
 
         # --- Fortschritt ----------------------------------------------
         prog = ttk.Frame(self)
@@ -144,6 +146,10 @@ class App(tk.Tk):
         if path:
             self.template_path = path
             self.var_tpl.set(os.path.basename(path))
+
+    def _reset_template(self):
+        self.template_path = None
+        self.var_tpl.set("Netzwerkdoku-Vorlage (eingebaut)")
 
     def _current_depth(self) -> str:
         label = self.var_depth.get()
