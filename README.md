@@ -48,6 +48,31 @@ baut `dist/Netzwerk-Scanner.app` und packt sie in `Netzwerk-Scanner.dmg`.
 
 Optional für ein schöneres DMG-Fenster: `brew install create-dmg`.
 
+### Wichtig: Für die Weitergabe an ANDERE Macs
+
+Damit die App auch auf anderen Macs läuft (Intel **und** Apple Silicon, auch
+ältere macOS-Versionen), muss mit dem **offiziellen Python von python.org**
+gebaut werden – nicht mit Homebrew-Python. Homebrew-Binaries sind nur für den
+Bau-Mac gedacht und stürzen auf anderen Macs ab
+(`libexpat: Symbol not found … built for macOS 26 which is newer than running OS`).
+
+Einmalig einrichten:
+
+1. Installer laden: <https://www.python.org/downloads/macos/> → aktuelle
+   **Python 3.12** „macOS 64-bit universal2 installer" (z.B. 3.12.x) und installieren.
+2. `./build.sh` erneut ausführen.
+
+`build.sh` erkennt python.org-Python automatisch, baut dann **universal2**
+(Intel + Apple Silicon) mit macOS-Mindestversion 11 und meldet:
+`-> portabler Build (universal2, macOS 11+)`. Findet es nur Homebrew-Python,
+warnt es und baut eine App, die nur auf dem Bau-Mac läuft.
+
+Beim ersten Öffnen auf einem fremden Mac ggf. die Gatekeeper-Quarantäne lösen:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Netzwerk-Scanner.app
+```
+
 ### Erster Start
 Die App ist nicht bei Apple signiert. Beim ersten Öffnen:
 **Rechtsklick auf die App → „Öffnen" → „Öffnen"** bestätigen. macOS fragt

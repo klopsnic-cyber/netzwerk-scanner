@@ -14,40 +14,71 @@ VENV=".venv"
 
 echo "==> 1/6  Python-Umgebung vorbereiten"
 
-# Ein Python mit modernem Tk 8.6 finden. Apples System-Python (3.9 unter
-# /Library/Developer/CommandLineTools) nutzt das defekte Tk 8.5 und erzeugt
-# leere Fenster -> deshalb bevorzugen wir Homebrew-Python.
-pick_python() {
-  local cand ver
+# Python für den Build wählen. Wichtig für die WEITERGABE an andere Macs:
+#   - python.org-Python ist "universal2" (Intel + Apple Silicon) und für eine
+#     niedrige macOS-Mindestversion gebaut -> läuft auch auf älteren Macs.
+#   - Homebrew-Python ist NUR für dieses macOS/diese Architektur gebaut und
+#     stürzt auf anderen Macs ab (z.B. "libexpat: Symbol not found").
+# Deshalb bevorzugen wir python.org-Python; Homebrew nur als Notlösung.
+PYBIN=""
+PORTABLE=0
+have_tk86() {
+  local ver
+  ver=$("$1" -c 'import tkinter; print(tkinter.TkVersion)' 2>/dev/null) || return 1
+  [ "$(printf '%s\n8.6\n' "$ver" | sort -V | head -1)" = "8.6" ]
+}
+# 1) python.org (portabel, universal2) – bevorzugt
+for cand in \
+    /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.11/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.10/bin/python3; do
+  if command -v "$cand" >/dev/null 2>&1 && have_tk86 "$cand"; then
+    PYBIN="$cand"; PORTABLE=1; break
+  fi
+done
+# 2) Notlösung: Homebrew/andere (App läuft dann NUR auf diesem Mac-Typ)
+if [ -z "$PYBIN" ]; then
   for cand in \
       /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 \
       /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3 \
-      /usr/local/bin/python3 \
-      python3.13 python3.12 python3.11 python3; do
-    command -v "$cand" >/dev/null 2>&1 || continue
-    ver=$("$cand" -c 'import tkinter; print(tkinter.TkVersion)' 2>/dev/null) || continue
-    # Tk >= 8.6 akzeptieren (8.5 ist Apples defektes System-Tk)
-    if [ "$(printf '%s\n8.6\n' "$ver" | sort -V | head -1)" = "8.6" ]; then
-      echo "$cand"; return 0
+      /usr/local/bin/python3 python3.13 python3.12 python3.11 python3; do
+    if command -v "$cand" >/dev/null 2>&1 && have_tk86 "$cand"; then
+      PYBIN="$cand"; break
     fi
   done
-  return 1
-}
-
-PYBIN="$(pick_python || true)"
-if [ -z "${PYBIN:-}" ]; then
-  echo "    FEHLER: Kein Python mit funktionierendem Tk 8.6 gefunden."
-  echo "    Bitte einmalig ausführen:  brew install python-tk"
-  echo "    (installiert Homebrew-Python samt Tk 8.6) und danach ./build.sh erneut."
+fi
+if [ -z "$PYBIN" ]; then
+  echo "    FEHLER: Kein geeignetes Python mit Tk 8.6 gefunden."
+  echo "    Empfohlen für portable Apps: python.org-Installer laden (siehe README)."
   exit 1
 fi
 TKVER=$("$PYBIN" -c 'import tkinter; print(tkinter.TkVersion)')
 echo "    Python: $PYBIN  (Tk $TKVER)"
+if [ "$PORTABLE" = "1" ]; then
+  export APP_TARGET_ARCH="universal2"
+  export MACOSX_DEPLOYMENT_TARGET="11.0"
+  echo "    -> portabler Build (universal2, macOS 11+): läuft auf Intel & Apple Silicon."
+else
+  echo "    ================================================================"
+  echo "    WARNUNG: Kein python.org-Python gefunden – es wird Homebrew/System"
+  echo "    genutzt. Die App läuft dann NUR auf einem Mac mit gleicher"
+  echo "    Architektur UND gleicher (oder neuerer) macOS-Version wie hier."
+  echo "    Für eine an andere Macs verteilbare App bitte python.org-Python"
+  echo "    installieren (Anleitung in der README) und ./build.sh erneut starten."
+  echo "    ================================================================"
+fi
 
-# Falls eine alte Umgebung mit dem falschen (System-)Python existiert: neu bauen.
-if [ -d "$VENV" ] && ! "$VENV/bin/python" -c 'import tkinter; assert tkinter.TkVersion>=8.6' >/dev/null 2>&1; then
-  echo "    Alte Umgebung nutzt defektes Tk -> wird neu erstellt."
-  rm -rf "$VENV"
+# Alte Umgebung neu bauen, wenn sie auf ein anderes Basis-Python zeigt
+# (z.B. Wechsel Homebrew -> python.org) oder defektes Tk nutzt.
+TARGET_BASE=$("$PYBIN" -c 'import sys; print(sys.base_prefix)')
+if [ -d "$VENV" ]; then
+  VENV_BASE=$("$VENV/bin/python" -c 'import sys; print(sys.base_prefix)' 2>/dev/null || echo "x")
+  if [ "$VENV_BASE" != "$TARGET_BASE" ] || \
+     ! "$VENV/bin/python" -c 'import tkinter; assert tkinter.TkVersion>=8.6' >/dev/null 2>&1; then
+    echo "    Umgebung passt nicht zum gewählten Python -> wird neu erstellt."
+    rm -rf "$VENV"
+  fi
 fi
 if [ ! -d "$VENV" ]; then
   "$PYBIN" -m venv "$VENV"

@@ -50,7 +50,7 @@ exe = EXE(
     console=False,          # GUI-App (kein Terminalfenster)
     disable_windowed_traceback=False,
     argv_emulation=True,     # Datei-Doppelklick / Öffnen-Events auf macOS
-    target_arch=None,        # universal2 möglich, wenn Python universal ist
+    target_arch=(_os.environ.get("APP_TARGET_ARCH") or None),  # z.B. "universal2"
     codesign_identity=None,
     entitlements_file=None,
 )
@@ -76,7 +76,7 @@ app = BUNDLE(
         "CFBundleDisplayName": "Netzwerk-Scanner",
         "CFBundleShortVersionString": "1.0.0",
         "CFBundleVersion": "1.0.0",
-        "LSMinimumSystemVersion": "12.0",
+        "LSMinimumSystemVersion": "11.0",
         "NSHighResolutionCapable": True,
         # Erklärungstext für die macOS-"Lokales Netzwerk"-Abfrage:
         "NSLocalNetworkUsageDescription":
