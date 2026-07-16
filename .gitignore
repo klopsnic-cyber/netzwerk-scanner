@@ -1,0 +1,22 @@
+# Build-Artefakte
+build/
+dist/
+*.dmg
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Große, generierte Herstellerdatenbank (wird von build.sh geladen)
+data/oui.csv
+
+# macOS
+.DS_Store
+
+# Test-/Export-Ausgaben
+Netzwerkdoku_*.xlsx
+_test_export.xlsx
