@@ -9,6 +9,7 @@ thread-sicher).
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import queue
 import subprocess
@@ -42,6 +43,13 @@ DEPTH_LABELS = {
     "gruendlich": "Gründlich (alle Ports + Banner)",
 }
 DEPTH_ORDER = ["schnell", "standard", "gruendlich"]
+
+# Ports, bei denen ein Doppelklick/Hover auf die Web-Oberfläche hinweist.
+WEB_PORTS = {80, 443, 8080, 8443}
+
+# Session-Persistenz (letzter Scan wird beim Beenden gesichert).
+SESSION_DIR = os.path.expanduser("~/Library/Application Support/Netzwerk-Scanner")
+SESSION_FILE = os.path.join(SESSION_DIR, "last_session.json")
 
 # Spalten: (key, Überschrift, Breite, Ausrichtung)
 TREE_COLUMNS = [
@@ -96,12 +104,16 @@ class App(tk.Tk):
         self.msg_queue: "queue.Queue" = queue.Queue()
         self._icon_img = None
         self._sort_state = {}
+        self._item_host = {}  # Tree-Item-ID -> Host
+        self._last_status = f"Bereit · OUI-Datenbank: {database_size()} Hersteller"
 
         self._init_fonts()
         self._init_style()
         self._build_ui()
         self._set_window_icon()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_queue)
+        self.after(50, self._maybe_restore_session)
 
     # ------------------------------------------------------------- Styling
     def _init_fonts(self):
@@ -269,8 +281,19 @@ class App(tk.Tk):
         # --- Ergebnis-Tabelle -----------------------------------------
         c3, b3 = self._card(wrap, pad=1)
         c3.pack(fill="both", expand=True)
+
+        filter_row = tk.Frame(b3, bg=CARD)
+        filter_row.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(filter_row, text="Filter/Suche").pack(side="left", padx=(0, 6))
+        self.var_filter = tk.StringVar()
+        filter_entry = ttk.Entry(filter_row, textvariable=self.var_filter, width=40)
+        filter_entry.pack(side="left")
+        filter_entry.bind("<KeyRelease>", self._apply_filter)
+
+        tree_frame = tk.Frame(b3, bg=CARD)
+        tree_frame.pack(fill="both", expand=True)
         cols = [c[0] for c in TREE_COLUMNS]
-        self.tree = ttk.Treeview(b3, columns=cols, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
         for key, label, width, anchor in TREE_COLUMNS:
             if key == "icon":
                 self.tree.heading(key, text=label)
@@ -280,11 +303,16 @@ class App(tk.Tk):
                              stretch=(key in ("device", "hostname", "vendor")))
         self.tree.tag_configure("odd", background=CARD)
         self.tree.tag_configure("even", background=STRIPE)
-        vsb = ttk.Scrollbar(b3, orient="vertical", command=self.tree.yview)
+        self.tree.tag_configure("muted", foreground=MUTED)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<Button-2>", self._show_context_menu)
+        self.tree.bind("<Button-3>", self._show_context_menu)
+        self.tree.bind("<Motion>", self._on_tree_motion)
+        self.tree.bind("<Leave>", self._on_tree_leave)
 
         # --- Aktionen --------------------------------------------------
         actions = tk.Frame(wrap, bg=BG)
@@ -335,6 +363,7 @@ class App(tk.Tk):
             return
 
         self.hosts = []
+        self._item_host = {}
         self.tree.delete(*self.tree.get_children())
         self.var_count.set("0 Geräte")
         self.var_summary.set("")
@@ -363,6 +392,49 @@ class App(tk.Tk):
             self.scanner.cancel()
         self.var_status.set("Abbruch angefordert …")
 
+    # --------------------------------------------------- Session-Persistenz
+    def _on_close(self):
+        if self.scan_thread and self.scan_thread.is_alive():
+            self._cancel_scan()
+        if self.hosts:
+            self._save_session()
+        self.destroy()
+
+    def _save_session(self):
+        try:
+            os.makedirs(SESSION_DIR, exist_ok=True)
+            data = {
+                "kunde": self.var_kunde.get(),
+                "kundennr": self.var_kundennr.get(),
+                "datum": self.var_datum.get(),
+                "hosts": [h.to_dict() for h in self.hosts],
+            }
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass  # Session-Sicherung ist ein Komfortfeature, kein Beinbruch
+
+    def _maybe_restore_session(self):
+        if not os.path.exists(SESSION_FILE):
+            return
+        if not messagebox.askyesno("Sitzung wiederherstellen",
+                                   "Letzten Scan wiederherstellen?"):
+            return
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.var_kunde.set(data.get("kunde", ""))
+            self.var_kundennr.set(data.get("kundennr", ""))
+            self.var_datum.set(data.get("datum", ""))
+            self.hosts = [Host.from_dict(d) for d in data.get("hosts", [])]
+            self._rebuild_tree()
+            self._set_counts()
+            if self.hosts:
+                self.btn_export.config(state="normal")
+            self._update_summary()
+        except Exception as e:
+            messagebox.showerror("Wiederherstellen fehlgeschlagen", str(e))
+
     def _export(self):
         if not self.hosts:
             return
@@ -390,16 +462,45 @@ class App(tk.Tk):
     # ------------------------------------------------------- Tabelle/Events
     def _row_values(self, h: Host):
         ports = ", ".join(str(p) for p in sorted(h.open_ports))
-        return (device_emoji(h.device_type, h.os_hint), h.ip, h.vendor,
+        icon = "⚠" if h.scan_warning else device_emoji(h.device_type, h.os_hint)
+        return (icon, h.ip, h.vendor,
                 h.device_type, h.hostname, h.mac, h.win_function, ports)
 
     def _add_host_row(self, h: Host):
         tag = "even" if len(self.tree.get_children()) % 2 else "odd"
-        self.tree.insert("", "end", values=self._row_values(h), tags=(tag,))
+        tags = (tag, "muted") if h.ignored else (tag,)
+        item = self.tree.insert("", "end", values=self._row_values(h), tags=tags)
+        self._item_host[item] = h
 
     def _restripe(self):
         for i, item in enumerate(self.tree.get_children()):
             self.tree.item(item, tags=("even" if i % 2 else "odd",))
+
+    def _matches_filter(self, h: Host, q: str) -> bool:
+        haystacks = (h.ip, h.vendor, h.device_type, h.hostname, h.mac)
+        return any(q in (v or "").lower() for v in haystacks)
+
+    def _rebuild_tree(self):
+        q = self.var_filter.get().strip().lower() if hasattr(self, "var_filter") else ""
+        self.tree.delete(*self.tree.get_children())
+        self._item_host = {}
+        for h in self.hosts:
+            if q and not self._matches_filter(h, q):
+                continue
+            self._add_host_row(h)
+
+    def _apply_filter(self, event=None):
+        self._rebuild_tree()
+
+    def _has_web_port(self, h: Host) -> bool:
+        return bool(WEB_PORTS & set(h.open_ports))
+
+    def _set_counts(self):
+        n = len(self.hosts)
+        ignored = sum(1 for h in self.hosts if h.ignored)
+        text = f"{n} Geräte" + (f" ({ignored} ignoriert)" if ignored else "")
+        self.var_count.set(text)
+        self.hdr_count.config(text=text)
 
     def _sort_by(self, key):
         idx = [c[0] for c in TREE_COLUMNS].index(key)
@@ -416,23 +517,92 @@ class App(tk.Tk):
 
         self.hosts.sort(key=sort_key, reverse=reverse)
         self._sort_state[key] = not reverse
-        self.tree.delete(*self.tree.get_children())
-        for h in self.hosts:
-            self._add_host_row(h)
+        self._rebuild_tree()
 
     def _on_double_click(self, event):
         item = self.tree.identify_row(event.y)
+        h = self._item_host.get(item) if item else None
+        if not h or not self._has_web_port(h):
+            return
+        scheme = "https" if (443 in h.open_ports or 8443 in h.open_ports) else "http"
+        try:
+            subprocess.run(["open", f"{scheme}://{h.ip}"])
+        except Exception:
+            pass
+
+    def _show_context_menu(self, event):
+        item = self.tree.identify_row(event.y)
         if not item:
             return
-        vals = self.tree.item(item, "values")
-        ip = vals[1]
-        ports = vals[7]
-        scheme = "https" if "443" in ports else "http"
-        if any(p in ports for p in ("80", "443", "8080", "8443")):
-            try:
-                subprocess.run(["open", f"{scheme}://{ip}"])
-            except Exception:
-                pass
+        h = self._item_host.get(item)
+        if h is None:
+            return
+        self.tree.selection_set(item)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Bearbeiten…", command=lambda: self._edit_host(h))
+        label = "Nicht mehr ignorieren" if h.ignored else "Ignorieren"
+        menu.add_command(label=label, command=lambda: self._toggle_ignored(h))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _toggle_ignored(self, h: Host):
+        h.ignored = not h.ignored
+        self._rebuild_tree()
+        self._set_counts()
+
+    def _edit_host(self, h: Host):
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Bearbeiten – {h.ip}")
+        dlg.configure(bg=BORDER)
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        inner = tk.Frame(dlg, bg=CARD)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        body = tk.Frame(inner, bg=CARD)
+        body.pack(fill="both", expand=True, padx=18, pady=16)
+
+        title = h.hostname or h.vendor or h.device_type or "Gerät"
+        ttk.Label(body, text=f"{h.ip} · {title}", style="CardTitle.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        var_standort = tk.StringVar(value=h.standort)
+        var_user = tk.StringVar(value=h.user)
+        var_verbunden = tk.StringVar(value=h.angebunden_an)
+        var_eingerichtet = tk.StringVar(value=h.eingerichtet_von)
+        rows = [
+            ("Standort", var_standort),
+            ("User", var_user),
+            ("angebunden an", var_verbunden),
+            ("eingerichtet von", var_eingerichtet),
+        ]
+        for i, (label, var) in enumerate(rows, start=1):
+            ttk.Label(body, text=label).grid(row=i, column=0, sticky="w", padx=(0, 10), pady=4)
+            ttk.Entry(body, textvariable=var, width=28).grid(row=i, column=1, pady=4)
+
+        def save():
+            h.standort = var_standort.get()
+            h.user = var_user.get()
+            h.angebunden_an = var_verbunden.get()
+            h.eingerichtet_von = var_eingerichtet.get()
+            dlg.destroy()
+
+        btns = tk.Frame(body, bg=CARD)
+        btns.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Abbrechen", command=dlg.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btns, text="Speichern", style="Accent.TButton", command=save).pack(side="right")
+        dlg.grab_set()
+
+    def _on_tree_motion(self, event):
+        item = self.tree.identify_row(event.y)
+        h = self._item_host.get(item) if item else None
+        self.var_status.set(h.scan_warning if (h and h.scan_warning) else self._last_status)
+        self.tree.configure(cursor="hand2" if (h and self._has_web_port(h)) else "")
+
+    def _on_tree_leave(self, event):
+        self.var_status.set(self._last_status)
+        self.tree.configure(cursor="")
 
     def _update_summary(self):
         from collections import Counter
@@ -450,12 +620,12 @@ class App(tk.Tk):
                     _, frac, msg = item
                     self.progress["value"] = frac
                     self.var_status.set(msg)
+                    self._last_status = msg
                 elif kind == "host":
                     h = item[1]
                     self.hosts.append(h)
                     self._add_host_row(h)
-                    self.var_count.set(f"{len(self.hosts)} Geräte")
-                    self.hdr_count.config(text=f"{len(self.hosts)} Geräte")
+                    self._set_counts()
                 elif kind == "done":
                     self.hosts = item[1] or self.hosts
                     self._finish_scan()
@@ -471,9 +641,7 @@ class App(tk.Tk):
         self.btn_cancel.config(state="disabled")
         if self.hosts:
             self.btn_export.config(state="normal")
-        n = len(self.hosts)
-        self.var_count.set(f"{n} Geräte")
-        self.hdr_count.config(text=f"{n} Geräte")
+        self._set_counts()
         self._update_summary()
 
 

@@ -25,7 +25,7 @@ import struct
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Callable, Dict, List, Optional
 
 from .oui import lookup_vendor
@@ -47,12 +47,39 @@ class Host:
     os_hint: str = ""           # z.B. "Windows", aus Ports/Bannern
     software: str = ""          # Softwarestand-Hinweise (Banner)
     win_function: str = ""      # Windows-Funktion (geraten, z.B. SQL/RDP)
+    # Manuelle Nacharbeit-Felder (bleiben leer, bis in der GUI bearbeitet).
+    # Kennwort bewusst NICHT hier - Klartext-Passwörter sollen nicht in der
+    # App/JSON landen, das bleibt manuelle Excel-Nacharbeit wie bisher.
+    standort: str = ""
+    user: str = ""
+    angebunden_an: str = ""
+    eingerichtet_von: str = ""
+    scan_warning: str = ""      # leer = kein Problem; sonst kurzer Hinweistext
+    ignored: bool = False       # True = beim Export ausgeschlossen
 
     def sort_key(self):
         try:
             return int(ipaddress.ip_address(self.ip))
         except ValueError:
             return 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Host":
+        valid = {f.name for f in fields(cls)}
+        data = {k: v for k, v in d.items() if k in valid}
+        # JSON kennt keine int-Keys/hat kein "fehlendes Feld" -> defensiv normalisieren
+        # (z.B. bei einer von Hand editierten oder aus einer alten Version stammenden Session-Datei).
+        data["open_ports"] = [int(p) for p in (data.get("open_ports") or [])]
+        data["services"] = {int(k): v for k, v in (data.get("services") or {}).items()}
+        return cls(**data)
+
+
+def _add_warning(existing: str, new: str) -> str:
+    """Hängt eine weitere Warnung an, statt eine vorherige zu überschreiben."""
+    return f"{existing}; {new}" if existing else new
 
 
 # Ports, die "gründlich" geprüft werden. Dienst-Name dient als Hinweis.
@@ -235,8 +262,10 @@ def read_arp_table() -> Dict[str, str]:
 def reverse_dns(ip: str) -> str:
     try:
         return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return ""
+    except (socket.herror, socket.gaierror):
+        return ""  # kein PTR-Eintrag - normal, kein Fehler
+    # andere Exceptions (z.B. DNS-Resolver nicht erreichbar) bewusst nicht
+    # geschluckt - Aufrufer wertet das als echten Fehlschlag.
 
 
 # --- mDNS / Bonjour (.local-Namen) ----------------------------------------
@@ -305,14 +334,17 @@ def mdns_name(ip: str, timeout: float = 1.0) -> str:
     """Fragt den Bonjour/.local-Namen per Multicast-DNS (PTR) ab.
 
     Findet Namen vieler Apple-, Linux- und IoT-Geräte, die kein Reverse-DNS
-    und kein NetBIOS haben.
+    und kein NetBIOS haben. Keine Antwort (Timeout) ist normal und liefert
+    "". Andere Exceptions (Socket-/Sendefehler) werden bewusst NICHT
+    geschluckt, sondern propagiert - der Aufrufer wertet das als echten
+    Fehlschlag statt als "kein Name gefunden".
     """
+    rev = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+    query = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    query += _dns_encode_name(rev)
+    query += b"\x00\x0c" + b"\x80\x01"  # QTYPE=PTR, QCLASS=IN + Unicast-Antwort
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        rev = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
-        query = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-        query += _dns_encode_name(rev)
-        query += b"\x00\x0c" + b"\x80\x01"  # QTYPE=PTR, QCLASS=IN + Unicast-Antwort
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
@@ -326,33 +358,38 @@ def mdns_name(ip: str, timeout: float = 1.0) -> str:
             try:
                 data, _ = s.recvfrom(2048)
             except socket.timeout:
-                break
+                break  # keine Antwort - normal, kein Fehler
             name = _parse_ptr(data)
             if name:
                 result = name
                 break
-        s.close()
         if result:
             # ".local"-Suffix und Endpunkt entfernen -> kompakter Name
             return result.rstrip(".").removesuffix(".local")
         return ""
-    except Exception:
-        return ""
+    finally:
+        s.close()
 
 
 def netbios_name(ip: str, timeout: float = 1.0) -> str:
-    """Fragt den NetBIOS-Namen (NBSTAT) per UDP/137 ab – für Windows-Geräte."""
+    """Fragt den NetBIOS-Namen (NBSTAT) per UDP/137 ab – für Windows-Geräte.
+
+    Keine Antwort (Timeout, z.B. bei jedem Nicht-Windows-Gerät) ist normal
+    und liefert "". Andere Exceptions werden bewusst propagiert.
+    """
+    # NBSTAT-Anfrage (Node Status)
+    tid = b"\x42\x42"
+    query = tid + b"\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+    query += b"\x20" + b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + b"\x00"
+    query += b"\x00\x21\x00\x01"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # NBSTAT-Anfrage (Node Status)
-        tid = b"\x42\x42"
-        query = tid + b"\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-        query += b"\x20" + b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + b"\x00"
-        query += b"\x00\x21\x00\x01"
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         sock.sendto(query, (ip, 137))
-        data, _ = sock.recvfrom(1024)
-        sock.close()
+        try:
+            data, _ = sock.recvfrom(1024)
+        except socket.timeout:
+            return ""  # keine Antwort - normal, kein Fehler
         num_names = data[56]
         offset = 57
         for _ in range(num_names):
@@ -363,8 +400,8 @@ def netbios_name(ip: str, timeout: float = 1.0) -> str:
             if flags & 0x80 == 0 and name and name != "__MSBROWSE__":
                 return name
         return ""
-    except Exception:
-        return ""
+    finally:
+        sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -372,18 +409,26 @@ def netbios_name(ip: str, timeout: float = 1.0) -> str:
 # ---------------------------------------------------------------------------
 
 def scan_port(ip: str, port: int, timeout: float = 0.6) -> bool:
+    """True, wenn der Port offen ist. connect_ex() liefert für einen
+    geschlossenen/abgelehnten Port einen Fehlercode zurück (kein Exception) -
+    ein hier auftretender Exception ist daher immer ein echtes Problem
+    (z.B. Ressourcen-Erschöpfung) und wird bewusst NICHT geschluckt."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         return s.connect_ex((ip, port)) == 0
-    except Exception:
-        return False
     finally:
         s.close()
 
 
 def grab_banner(ip: str, port: int, timeout: float = 1.0) -> str:
-    """Versucht ein Text-Banner zu lesen (HTTP/SSH/SMTP…)."""
+    """Versucht ein Text-Banner zu lesen (HTTP/SSH/SMTP…).
+
+    Der Port ist beim Aufruf bereits als offen bekannt; bleibt eine Antwort
+    schlicht aus (Timeout/Verbindungsabbruch), ist das normal (nicht jeder
+    Dienst sendet sofort ein Banner) und liefert "". Andere Exceptions
+    werden bewusst propagiert.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -400,7 +445,7 @@ def grab_banner(ip: str, port: int, timeout: float = 1.0) -> str:
         if m:
             return m.group(1).strip()
         return text.splitlines()[0].strip() if text else ""
-    except Exception:
+    except (socket.timeout, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
         return ""
     finally:
         s.close()
@@ -483,25 +528,31 @@ class Scanner:
             if h.mac:
                 h.vendor = lookup_vendor(h.mac)
             # Namen: Reverse-DNS -> mDNS/Bonjour -> NetBIOS
-            h.hostname = reverse_dns(ip)
-            if not h.hostname:
-                h.hostname = mdns_name(ip, cfg.ping_timeout)
-            if not h.hostname:
-                nb = netbios_name(ip, cfg.ping_timeout)
-                if nb:
-                    h.hostname = nb
-                    h.os_hint = "Windows"
+            try:
+                h.hostname = reverse_dns(ip)
+                if not h.hostname:
+                    h.hostname = mdns_name(ip, cfg.ping_timeout)
+                if not h.hostname:
+                    nb = netbios_name(ip, cfg.ping_timeout)
+                    if nb:
+                        h.hostname = nb
+                        h.os_hint = "Windows"
+            except Exception:
+                h.scan_warning = _add_warning(h.scan_warning, "Namensauflösung fehlgeschlagen")
             # Ports
-            for port in cfg.ports:
-                if self._cancel.is_set():
-                    break
-                if scan_port(ip, port, cfg.port_timeout):
-                    h.open_ports.append(port)
-                    h.services[port] = COMMON_PORTS.get(port, str(port))
-                    if cfg.do_banner and port in BANNER_PORTS:
-                        b = grab_banner(ip, port, cfg.port_timeout + 0.4)
-                        if b:
-                            h.services[port] = b
+            try:
+                for port in cfg.ports:
+                    if self._cancel.is_set():
+                        break
+                    if scan_port(ip, port, cfg.port_timeout):
+                        h.open_ports.append(port)
+                        h.services[port] = COMMON_PORTS.get(port, str(port))
+                        if cfg.do_banner and port in BANNER_PORTS:
+                            b = grab_banner(ip, port, cfg.port_timeout + 0.4)
+                            if b:
+                                h.services[port] = b
+            except Exception:
+                h.scan_warning = _add_warning(h.scan_warning, "Portscan fehlgeschlagen")
             # Ableitungen
             classify_device(h)
             return h
@@ -515,7 +566,8 @@ class Scanner:
                 try:
                     h = fut.result()
                 except Exception:
-                    h = Host(ip=futures[fut])
+                    h = Host(ip=futures[fut],
+                              scan_warning="Scan fehlgeschlagen (unerwarteter Fehler)")
                 with lock:
                     hosts.append(h)
                 if on_host:

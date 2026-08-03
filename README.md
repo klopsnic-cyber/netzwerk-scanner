@@ -8,9 +8,10 @@ werden von Hand ergänzt.
 Merkmale: modernes Oberflächen-Theme mit eigenem App-Icon und Gerätetyp-Symbolen,
 aktive Erreichbarkeitsprüfung (nur Geräte, die zur Scan-Zeit antworten – kein
 veralteter ARP-Cache, funktioniert auch netzübergreifend), Namensauflösung per
-Reverse-DNS, mDNS/Bonjour und NetBIOS, sortierbare Tabelle, Doppelklick öffnet
-die Web-Oberfläche eines Geräts, und die Excel-Vorlage ist fest eingebaut
-(keine externe Datei nötig).
+Reverse-DNS, mDNS/Bonjour und NetBIOS, sortierbare und filterbare Tabelle,
+manuelle Nacharbeit-Felder direkt in der App editierbar, Doppelklick öffnet
+die Web-Oberfläche eines Geräts, Sitzungswiederherstellung nach Neustart, und
+die Excel-Vorlage ist fest eingebaut (keine externe Datei nötig).
 
 ## Was der Scanner automatisch füllt
 
@@ -21,17 +22,21 @@ die Web-Oberfläche eines Geräts, und die Excel-Vorlage ist fest eingebaut
 | Gerätetyp | 🟡 geraten | offene Ports + Hostname + Hersteller |
 | Netzwerkname | ✅ | Reverse-DNS / mDNS / NetBIOS |
 | MAC-Adresse | ✅ | ARP-Tabelle (nur gleiches Subnetz) |
-| Standort | ➖ leer | manuell |
-| User | ➖ leer | manuell |
-| Kennwort | ➖ leer | manuell |
-| angebunden an | ➖ leer | manuell |
+| Standort | 🟢 in der App editierbar | Rechtsklick → „Bearbeiten…" |
+| User | 🟢 in der App editierbar | Rechtsklick → „Bearbeiten…" |
+| Kennwort | ➖ leer / manuell (Excel) | aus Sicherheitsgründen nicht in der App editierbar |
+| angebunden an | 🟢 in der App editierbar | Rechtsklick → „Bearbeiten…" |
 | Windows Funktion | 🟡 geraten | erkannte Dienste (SQL, RDP, AD …) |
 | Sonstiges | 🟡 | Liste offener Ports |
 | Softwarestand | 🟡 geraten | Banner (Server-Version u.ä.) |
-| eingerichtet von | ➖ leer | manuell |
+| eingerichtet von | 🟢 in der App editierbar | Rechtsklick → „Bearbeiten…" |
 
 > Hinweis: MAC-Adresse und Hersteller sind nur für Geräte im selben
 > IP-Subnetz verfügbar (technische Grenze von ARP).
+
+> Hinweis: Das Kennwort wird bewusst nicht in der App gespeichert oder
+> editierbar gemacht (keine Klartext-Passwörter in App/JSON) und muss wie
+> bisher von Hand in der exportierten Excel-Datei ergänzt werden.
 
 ## Fertige App bauen (auf einem Mac)
 
@@ -98,6 +103,39 @@ python3 app.py --cli 192.168.1.0/24  # reiner Terminal-Scan (umgeht die
 2. Optional Kundenname / Tomedo-Nummer / Datum eintragen.
 3. **Scan starten** – Geräte erscheinen live in der Tabelle.
 4. **In Excel exportieren** – erzeugt eine ausgefüllte Kopie der Vorlage.
+
+### Tabelle bearbeiten (Rechtsklick)
+
+Rechtsklick auf eine Zeile öffnet ein Kontextmenü:
+
+- **Bearbeiten…** – Dialog für Standort, User, „angebunden an" und
+  „eingerichtet von". Änderungen fließen direkt in den Excel-Export.
+- **Ignorieren** – blendet die Zeile gedimmt aus und schließt das Gerät vom
+  Excel-Export aus, z.B. für den scannenden Mac selbst oder fremde
+  Nachbargeräte bei falsch gewähltem Netzbereich. Der Gerätezähler zeigt dann
+  „X Geräte (Y ignoriert)". Über „Nicht mehr ignorieren" rückgängig zu machen.
+
+### Filtern
+
+Das Eingabefeld über der Tabelle filtert live nach IP, Hersteller, Gerätetyp,
+Netzwerkname oder MAC-Adresse.
+
+### Warnhinweise
+
+Schlägt bei einem Gerät die Namensauflösung oder der Portscan mit einem
+echten Fehler fehl (nicht bei normalem „nichts gefunden"), erscheint statt
+des Geräte-Symbols ein ⚠ in der Tabelle; beim Hover über die Zeile steht eine
+kurze Erklärung in der Statuszeile. Beim Hover über eine Zeile mit
+Web-Oberfläche (offener Port 80/443/8080/8443) wird der Mauszeiger zu einer
+Hand – Doppelklick öffnet die Web-Oberfläche im Browser.
+
+### Sitzung wiederherstellen
+
+Der letzte Scan (inkl. Kundendaten und aller bearbeiteten/ignorierten Felder)
+wird beim Schließen der App automatisch gesichert
+(`~/Library/Application Support/Netzwerk-Scanner/last_session.json`) und
+beim nächsten Start zur Wiederherstellung angeboten. Läuft beim Schließen
+noch ein Scan, wird dieser zuerst sauber abgebrochen.
 
 ## Projektstruktur
 

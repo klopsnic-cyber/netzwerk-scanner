@@ -33,14 +33,14 @@ COLUMN_MAP = {
     3:  lambda h: h.device_type,                          # Gerätetyp
     4:  lambda h: h.hostname,                             # Netzwerkname
     5:  lambda h: h.mac,                                  # MAC-Adresse
-    6:  lambda h: "",                                     # Standort (manuell)
-    7:  lambda h: "",                                     # User (manuell)
+    6:  lambda h: h.standort,                              # Standort
+    7:  lambda h: h.user,                                  # User
     8:  lambda h: "",                                     # Kennwort (manuell)
-    9:  lambda h: "",                                     # angebunden an (manuell)
+    9:  lambda h: h.angebunden_an,                         # angebunden an
     10: lambda h: h.win_function,                         # Windows Funktion
     11: lambda h: _ports_summary(h),                     # Sonstiges -> offene Ports
     12: lambda h: "",                                     # Softwarestand (manuell, bleibt leer)
-    13: lambda h: "",                                     # eingerichtet von (manuell)
+    13: lambda h: h.eingerichtet_von,                      # eingerichtet von
 }
 
 
@@ -74,6 +74,7 @@ def export(hosts: List[Host], out_path: str,
            kundenname: str = "", kundennummer: str = "",
            installationsdatum: str = "") -> str:
     """Füllt die Vorlage und speichert sie unter out_path. Gibt out_path zurück."""
+    hosts = [h for h in hosts if not h.ignored]
     wb = _load_template_workbook(template_path)
     ws = wb.active
 
