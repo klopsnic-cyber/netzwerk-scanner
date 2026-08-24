@@ -133,11 +133,15 @@ Hand – Doppelklick öffnet die Web-Oberfläche im Browser.
 
 Beim Start prüft die App im Hintergrund die
 [GitHub-Releases](https://github.com/klopsnic-cyber/netzwerk-scanner/releases)
-dieses (öffentlichen) Repos. Ist eine neuere Version verfügbar, erscheint oben
-rechts ein Button „Update verfügbar: vX.Y.Z" – Klick öffnet die Release-Seite
-im Browser zum Herunterladen der neuen `.dmg` (kein automatisches Ersetzen der
-laufenden App). Kein Internet/GitHub nicht erreichbar → der Check schlägt
-still fehl, die App läuft normal weiter.
+dieses (öffentlichen) Repos; der Button oben rechts lässt sich auch jederzeit
+manuell anklicken. Ist eine neuere Version verfügbar, zeigt der Button
+„Update verfügbar: vX.Y.Z" – ein Klick fragt kurz nach, lädt dann die `.dmg`
+herunter und ersetzt automatisch das laufende `.app`-Bundle; die App startet
+danach neu. Schlägt das fehl (kein Netz, kein Schreibrecht z.B. bei
+Nicht-Admin-Konten, o.ä.), bleibt die alte Version unangetastet lauffähig und
+es wird alternativ die Release-Seite im Browser zum manuellen Download
+angeboten. Kein Internet/GitHub nicht erreichbar beim stillen Start-Check →
+der Check schlägt einfach still fehl, die App läuft normal weiter.
 
 Neue Version veröffentlichen: `__version__` in `netzwerkscanner/__init__.py`
 erhöhen, `./build.sh` neu bauen, dann:

@@ -645,6 +645,13 @@ class App(tk.Tk):
                     self._finish_scan()
                 elif kind == "update":
                     self._on_update_result(item[1], manual=item[2])
+                elif kind == "install_progress":
+                    _, frac, msg = item
+                    self.btn_update.config(text=msg)
+                elif kind == "install_done":
+                    self._relaunch_after_update(item[1])
+                elif kind == "install_error":
+                    self._install_update_failed(item[1])
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)
@@ -656,7 +663,7 @@ class App(tk.Tk):
 
     def _on_update_click(self):
         if self._update_info:
-            webbrowser.open(self._update_info["url"])
+            self._confirm_and_install()
             return
         self.btn_update.config(text="Prüfe …", state="disabled")
         threading.Thread(target=self._check_update_bg, args=(True,), daemon=True).start()
@@ -673,6 +680,37 @@ class App(tk.Tk):
             self.after(3000, lambda: self.btn_update.config(
                 text=f"v{__version__} · Nach Updates suchen"))
         # Stiller Auto-Check ohne Ergebnis: Button bleibt wie er ist.
+
+    def _confirm_and_install(self):
+        info = self._update_info
+        notes = f"\n\n{info['notes']}" if info.get("notes") else ""
+        if not messagebox.askyesno(
+                "Update installieren",
+                f"Version {info['version']} jetzt herunterladen und installieren?\n"
+                f"Die App startet danach neu.{notes}"):
+            return
+        self.btn_update.config(state="disabled")
+        threading.Thread(target=self._install_update_bg, args=(info,), daemon=True).start()
+
+    def _install_update_bg(self, info: dict):
+        try:
+            new_path = update_check.install_update(
+                info, progress=lambda f, m: self.msg_queue.put(("install_progress", f, m)))
+            self.msg_queue.put(("install_done", new_path))
+        except Exception as e:
+            self.msg_queue.put(("install_error", str(e)))
+
+    def _relaunch_after_update(self, app_path: str):
+        subprocess.Popen(["open", app_path])
+        self._on_close()
+
+    def _install_update_failed(self, error: str):
+        self.btn_update.config(state="normal", text=f"Update verfügbar: v{self._update_info['version']}")
+        if messagebox.askyesno(
+                "Installation fehlgeschlagen",
+                f"Automatische Installation fehlgeschlagen:\n{error}\n\n"
+                "Stattdessen die Release-Seite im Browser öffnen (manueller Download)?"):
+            webbrowser.open(self._update_info["url"])
 
     def _finish_scan(self):
         self.btn_scan.config(state="normal")

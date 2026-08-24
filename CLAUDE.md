@@ -84,12 +84,19 @@ NetzwerkScanner.spec       PyInstaller-Konfiguration
    Scan; muss erlaubt werden, sonst keine Geräte. Info.plist enthält
    `NSLocalNetworkUsageDescription`. Root/sudo ist NICHT nötig (Ping + ARP-Cache).
 
-10. **Update-Check statt Auto-Update.** `update.py` fragt beim Start die
+10. **Update-Check UND Auto-Install.** `update.py` fragt beim Start die
     GitHub-Releases-API ab (öffentliches Repo, kein Token nötig) und vergleicht
-    Tag gegen `__version__`. Bei neuerer Version nur ein Hinweis-Button, der
-    die Release-Seite im Browser öffnet – KEIN automatisches Herunterladen/
-    Ersetzen der laufenden .app (Risiko bei ad-hoc-Signatur/Gatekeeper, siehe
-    Punkt 3+4). Release veröffentlichen: Version in `__init__.py` erhöhen,
+    Tag gegen `__version__`. Bei neuerer Version zeigt der Button „Update
+    verfügbar“; Klick fragt kurz nach, lädt dann die `.dmg` herunter, mountet
+    sie (`hdiutil`), kopiert das `.app` per `ditto` neben das laufende Bundle
+    und tauscht per `os.rename` (alt→`.old`, neu→Ziel, Rollback bei Fehler)
+    – danach `open` auf das neue Bundle + eigener Neustart. Läuft NUR im
+    gebauten `.app` (`sys.frozen`), im Dev-Modus/Quellcode-Start gibt es keinen
+    Bundle-Pfad zum Ersetzen. Jeder Fehler (kein Netz, keine Schreibrechte
+    z.B. bei Nicht-Admin-Konten, kaputte .dmg) bricht VOR bzw. mit Rollback
+    NACH dem Austausch ab und bietet den manuellen Download über die
+    Release-Seite als Rückfall an – die App bleibt in jedem Fehlerfall
+    lauffähig. Release veröffentlichen: Version in `__init__.py` erhöhen,
     `./build.sh`, dann `gh release create vX.Y.Z Netzwerk-Scanner.dmg`.
 
 ## Eingebettete Daten neu erzeugen
