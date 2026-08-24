@@ -8,6 +8,7 @@ thread-sicher).
 
 from __future__ import annotations
 
+import datetime
 import ipaddress
 import json
 import os
@@ -239,7 +240,7 @@ class App(tk.Tk):
             row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
         self.var_kunde = tk.StringVar()
         self.var_kundennr = tk.StringVar()
-        self.var_datum = tk.StringVar()
+        self.var_datum = tk.StringVar(value=datetime.date.today().strftime("%d.%m.%Y"))
         ttk.Label(b1, text="Kundenname").grid(row=1, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(b1, textvariable=self.var_kunde, width=26).grid(row=1, column=1, padx=(0, 16))
         ttk.Label(b1, text="Tomedo Kundennr.").grid(row=1, column=2, sticky="w", padx=(0, 6))
