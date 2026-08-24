@@ -18,6 +18,7 @@ from __future__ import annotations
 import concurrent.futures
 import errno
 import ipaddress
+import os
 import platform
 import re
 import socket
@@ -224,6 +225,19 @@ def probe(ip: str, timeout: float = 1.0) -> bool:
 
 _MAC_RE = re.compile(r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})")
 
+# Als gebaute .app (von Finder/LaunchServices statt Terminal gestartet) fehlt
+# oft /usr/sbin im PATH, wodurch "arp" per subprocess nicht gefunden wird
+# (ping/TCP-Probes finden trotzdem Geräte -> nur die MAC bleibt dann leer).
+# Deshalb feste Pfade zuerst versuchen, "arp" über PATH nur als Rückfall.
+_ARP_CANDIDATES = ["/usr/sbin/arp", "/sbin/arp", "arp"]
+
+
+def _arp_binary() -> str:
+    for path in _ARP_CANDIDATES:
+        if "/" not in path or os.path.exists(path):
+            return path
+    return "arp"
+
 
 def normalize_mac(mac: str) -> str:
     parts = mac.split(":")
@@ -244,7 +258,7 @@ def read_arp_table() -> Dict[str, str]:
                 if m:
                     table[m.group(1)] = normalize_mac(m.group(2).replace("-", ":"))
         else:
-            out = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run([_arp_binary(), "-a"], capture_output=True, text=True, timeout=10).stdout
             for line in out.splitlines():
                 ipm = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)", line)
                 macm = _MAC_RE.search(line)
