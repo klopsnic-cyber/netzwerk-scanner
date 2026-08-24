@@ -129,6 +129,23 @@ kurze Erklärung in der Statuszeile. Beim Hover über eine Zeile mit
 Web-Oberfläche (offener Port 80/443/8080/8443) wird der Mauszeiger zu einer
 Hand – Doppelklick öffnet die Web-Oberfläche im Browser.
 
+### Update-Check
+
+Beim Start prüft die App im Hintergrund die
+[GitHub-Releases](https://github.com/klopsnic-cyber/netzwerk-scanner/releases)
+dieses (öffentlichen) Repos. Ist eine neuere Version verfügbar, erscheint oben
+rechts ein Button „Update verfügbar: vX.Y.Z" – Klick öffnet die Release-Seite
+im Browser zum Herunterladen der neuen `.dmg` (kein automatisches Ersetzen der
+laufenden App). Kein Internet/GitHub nicht erreichbar → der Check schlägt
+still fehl, die App läuft normal weiter.
+
+Neue Version veröffentlichen: `__version__` in `netzwerkscanner/__init__.py`
+erhöhen, `./build.sh` neu bauen, dann:
+
+```bash
+gh release create vX.Y.Z Netzwerk-Scanner.dmg --title "vX.Y.Z" --notes "…"
+```
+
 ### Sitzung wiederherstellen
 
 Der letzte Scan (inkl. Kundendaten und aller bearbeiteten/ignorierten Felder)
@@ -147,6 +164,7 @@ IP-Scanner/
 │   ├── oui.py                 # Hersteller-Lookup (OUI)
 │   ├── classify.py            # Gerätetyp-Heuristik
 │   ├── exporter.py            # Excel-Ausgabe in die Vorlage
+│   ├── update.py               # Update-Check gegen GitHub Releases
 │   └── gui.py                 # Tkinter-Oberfläche
 ├── data/
 │   ├── Netzwerkdoku-Vorlage.xlsx

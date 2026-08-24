@@ -17,11 +17,13 @@ import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
 
 from . import __app_name__, __version__
 from . import exporter
+from . import update as update_check
 from .oui import database_size
 from .scanner import Host, ScanConfig, Scanner, guess_local_network
 
@@ -114,6 +116,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_queue)
         self.after(50, self._maybe_restore_session)
+        threading.Thread(target=self._check_update_bg, daemon=True).start()
 
     # ------------------------------------------------------------- Styling
     def _init_fonts(self):
@@ -218,6 +221,11 @@ class App(tk.Tk):
         self.hdr_count = tk.Label(header, text="", bg=ACCENT, fg="#FFFFFF",
                                   font=self.f_bold)
         self.hdr_count.pack(side="right", padx=20)
+        self.btn_update = tk.Button(
+            header, text="", bg="#FFC942", fg="#3A2A00", relief="flat",
+            font=self.f_small, padx=10, pady=3, cursor="hand2",
+            command=self._open_update_page)
+        self._update_info = None  # gesetzt sobald ein Update gefunden wurde
 
         wrap = tk.Frame(self, bg=BG)
         wrap.pack(fill="both", expand=True, padx=14, pady=12)
@@ -632,9 +640,26 @@ class App(tk.Tk):
                 elif kind == "error":
                     messagebox.showerror("Scan-Fehler", item[1])
                     self._finish_scan()
+                elif kind == "update":
+                    self._show_update_available(item[1])
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)
+
+    # ------------------------------------------------------------ Update
+    def _check_update_bg(self):
+        info = update_check.check_for_update()
+        if info:
+            self.msg_queue.put(("update", info))
+
+    def _show_update_available(self, info: dict):
+        self._update_info = info
+        self.btn_update.config(text=f"Update verfügbar: v{info['version']}")
+        self.btn_update.pack(side="right", padx=(0, 12))
+
+    def _open_update_page(self):
+        if self._update_info:
+            webbrowser.open(self._update_info["url"])
 
     def _finish_scan(self):
         self.btn_scan.config(state="normal")
