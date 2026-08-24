@@ -8,6 +8,10 @@ Ergebnis: dist/Netzwerk-Scanner.app
 block_cipher = None
 
 import os as _os
+import re as _re
+
+with open(_os.path.join(_os.path.dirname(_os.path.abspath(SPEC)), "netzwerkscanner", "__init__.py")) as _f:
+    _APP_VERSION = _re.search(r'__version__\s*=\s*"([^"]+)"', _f.read()).group(1)
 
 datas = [
     ("data/Netzwerkdoku-Vorlage.xlsx", "data"),
@@ -75,8 +79,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "Netzwerk-Scanner",
         "CFBundleDisplayName": "Netzwerk-Scanner",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1.0.0",
+        "CFBundleShortVersionString": _APP_VERSION,
+        "CFBundleVersion": _APP_VERSION,
         "LSMinimumSystemVersion": "11.0",
         "NSHighResolutionCapable": True,
         # Erklärungstext für die macOS-"Lokales Netzwerk"-Abfrage:
