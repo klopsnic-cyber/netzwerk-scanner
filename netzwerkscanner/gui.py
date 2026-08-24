@@ -223,8 +223,8 @@ class App(tk.Tk):
         self.hdr_count.pack(side="right", padx=20)
         self._update_info = None  # gesetzt sobald ein Update gefunden wurde
         self.btn_update = tk.Button(
-            header, text=f"v{__version__} · Nach Updates suchen", bg=ACCENT_DK, fg="#FFFFFF",
-            activebackground="#153F80", activeforeground="#FFFFFF", relief="flat",
+            header, text=f"v{__version__} · Nach Updates suchen", bg="#E7ECF4", fg=TEXT,
+            activebackground="#D8E0EC", activeforeground=TEXT, relief="flat",
             font=self.f_small, padx=10, pady=3, cursor="hand2", bd=0, highlightthickness=0,
             command=self._on_update_click)
         self.btn_update.pack(side="right", padx=(0, 12))
