@@ -221,11 +221,13 @@ class App(tk.Tk):
         self.hdr_count = tk.Label(header, text="", bg=ACCENT, fg="#FFFFFF",
                                   font=self.f_bold)
         self.hdr_count.pack(side="right", padx=20)
-        self.btn_update = tk.Button(
-            header, text="", bg="#FFC942", fg="#3A2A00", relief="flat",
-            font=self.f_small, padx=10, pady=3, cursor="hand2",
-            command=self._open_update_page)
         self._update_info = None  # gesetzt sobald ein Update gefunden wurde
+        self.btn_update = tk.Button(
+            header, text=f"v{__version__} · Nach Updates suchen", bg=ACCENT_DK, fg="#DCEBFF",
+            activebackground="#153F80", activeforeground="#FFFFFF", relief="flat",
+            font=self.f_small, padx=10, pady=3, cursor="hand2", bd=0, highlightthickness=0,
+            command=self._on_update_click)
+        self.btn_update.pack(side="right", padx=(0, 12))
 
         wrap = tk.Frame(self, bg=BG)
         wrap.pack(fill="both", expand=True, padx=14, pady=12)
@@ -286,6 +288,21 @@ class App(tk.Tk):
         tk.Label(prog, textvariable=self.var_status, bg=BG, fg=MUTED,
                  font=self.f_small, anchor="w", width=52).pack(side="left", padx=12)
 
+        # --- Aktionen (unten fest verankert, verschwindet nie hinter der
+        # Tabelle - vor der Tabelle gepackt + side="bottom") -------------
+        actions = tk.Frame(wrap, bg=BG)
+        actions.pack(side="bottom", fill="x", pady=(10, 0))
+        self.var_count = tk.StringVar(value="0 Geräte")
+        tk.Label(actions, textvariable=self.var_count, bg=BG, fg=TEXT,
+                 font=self.f_bold).pack(side="left")
+        self.var_summary = tk.StringVar(value="")
+        tk.Label(actions, textvariable=self.var_summary, bg=BG, fg=MUTED,
+                 font=self.f_small).pack(side="left", padx=12)
+        self.btn_export = ttk.Button(actions, text="In Excel exportieren …",
+                                     style="Accent.TButton", command=self._export,
+                                     state="disabled")
+        self.btn_export.pack(side="right")
+
         # --- Ergebnis-Tabelle -----------------------------------------
         c3, b3 = self._card(wrap, pad=1)
         c3.pack(fill="both", expand=True)
@@ -321,20 +338,6 @@ class App(tk.Tk):
         self.tree.bind("<Button-3>", self._show_context_menu)
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", self._on_tree_leave)
-
-        # --- Aktionen --------------------------------------------------
-        actions = tk.Frame(wrap, bg=BG)
-        actions.pack(fill="x", pady=(10, 0))
-        self.var_count = tk.StringVar(value="0 Geräte")
-        tk.Label(actions, textvariable=self.var_count, bg=BG, fg=TEXT,
-                 font=self.f_bold).pack(side="left")
-        self.var_summary = tk.StringVar(value="")
-        tk.Label(actions, textvariable=self.var_summary, bg=BG, fg=MUTED,
-                 font=self.f_small).pack(side="left", padx=12)
-        self.btn_export = ttk.Button(actions, text="In Excel exportieren …",
-                                     style="Accent.TButton", command=self._export,
-                                     state="disabled")
-        self.btn_export.pack(side="right")
 
     # ------------------------------------------------------------- Aktionen
     def _detect_net(self):
@@ -641,25 +644,35 @@ class App(tk.Tk):
                     messagebox.showerror("Scan-Fehler", item[1])
                     self._finish_scan()
                 elif kind == "update":
-                    self._show_update_available(item[1])
+                    self._on_update_result(item[1], manual=item[2])
         except queue.Empty:
             pass
         self.after(120, self._poll_queue)
 
     # ------------------------------------------------------------ Update
-    def _check_update_bg(self):
+    def _check_update_bg(self, manual: bool = False):
         info = update_check.check_for_update()
-        if info:
-            self.msg_queue.put(("update", info))
+        self.msg_queue.put(("update", info, manual))
 
-    def _show_update_available(self, info: dict):
-        self._update_info = info
-        self.btn_update.config(text=f"Update verfügbar: v{info['version']}")
-        self.btn_update.pack(side="right", padx=(0, 12))
-
-    def _open_update_page(self):
+    def _on_update_click(self):
         if self._update_info:
             webbrowser.open(self._update_info["url"])
+            return
+        self.btn_update.config(text="Prüfe …", state="disabled")
+        threading.Thread(target=self._check_update_bg, args=(True,), daemon=True).start()
+
+    def _on_update_result(self, info: Optional[dict], manual: bool):
+        self.btn_update.config(state="normal")
+        if info:
+            self._update_info = info
+            self.btn_update.config(text=f"Update verfügbar: v{info['version']}",
+                                   bg="#FFC942", fg="#3A2A00",
+                                   activebackground="#F5B900")
+        elif manual:
+            self.btn_update.config(text=f"v{__version__} · aktuell")
+            self.after(3000, lambda: self.btn_update.config(
+                text=f"v{__version__} · Nach Updates suchen"))
+        # Stiller Auto-Check ohne Ergebnis: Button bleibt wie er ist.
 
     def _finish_scan(self):
         self.btn_scan.config(state="normal")
