@@ -36,9 +36,67 @@ ACCENT_DK = "#1B5FBE"
 TEXT = "#1E2430"
 MUTED = "#6B7280"
 BORDER = "#DCE1EA"
+SHADOW = "#D2D8E4"    # dezenter Kartenschatten
 STRIPE = "#F3F7FE"    # Zebra-Zeile
+HOVER = "#E3EEFF"     # Zeile unter dem Mauszeiger
 HEAD_BG = "#0E2A4A"   # Tabellenkopf dunkelblau
 SEL = "#CFE3FF"       # Auswahl
+
+
+class RoundedCard(tk.Frame):
+    """Karte mit abgerundeten Ecken und dezentem Schatten (Canvas-Hintergrund).
+
+    `expand=False` (Standard) misst die Höhe selbst am Inhalt (für Karten,
+    die nur so hoch wie ihr Inhalt sein sollen). `expand=True` übernimmt die
+    vom Layout zugewiesene Höhe (für Karten, die den Restplatz füllen, z.B.
+    die Ergebnistabelle).
+    """
+
+    def __init__(self, parent, pad=16, radius=14, expand=False,
+                 bg_color=CARD, border_color=BORDER):
+        super().__init__(parent, bg=BG)
+        self._pad = pad
+        self._radius = radius
+        self._expand = expand
+        self._bg_color = bg_color
+        self._border_color = border_color
+        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.body = tk.Frame(self.canvas, bg=bg_color)
+        self._win = self.canvas.create_window(pad, pad, anchor="nw", window=self.body)
+        self.canvas.bind("<Configure>", self._redraw)
+
+    def _round_points(self, x1, y1, x2, y2, r):
+        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+        return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+                x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+                x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+    def _redraw(self, event=None):
+        w = self.canvas.winfo_width()
+        if self._expand:
+            h = self.canvas.winfo_height()
+        else:
+            h = self.body.winfo_reqheight() + 2 * self._pad + 4
+            if self.canvas.winfo_reqheight() != h:
+                self.canvas.configure(height=h)
+        if w < 8 or h < 8:
+            return
+        self.canvas.delete("shape")
+        r = self._radius
+        self.canvas.create_polygon(
+            self._round_points(2, 3, w - 2, h - 1, r),
+            smooth=True, fill=SHADOW, outline="", tags="shape")
+        self.canvas.create_polygon(
+            self._round_points(0, 0, w - 4, h - 4, r),
+            smooth=True, fill=self._bg_color, outline=self._border_color,
+            width=1, tags="shape")
+        self.canvas.tag_lower("shape")
+        self.canvas.coords(self._win, self._pad, self._pad)
+        self.canvas.itemconfig(
+            self._win,
+            width=max(w - 4 - 2 * self._pad, 1),
+            height=max(h - 4 - 2 * self._pad, 1))
 
 DEPTH_LABELS = {
     "schnell": "Schnell (nur wichtigste Ports)",
@@ -121,6 +179,9 @@ class App(tk.Tk):
         self.msg_queue: "queue.Queue" = queue.Queue()
         self._icon_img = None
         self._sort_state = {}
+        self._sort_col = None
+        self._sort_dir = False
+        self._hover_item = None
         self._item_host = {}  # Tree-Item-ID -> Host
         self._last_status = f"Bereit · OUI-Datenbank: {database_size()} Hersteller"
 
@@ -135,10 +196,13 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- Styling
     def _init_fonts(self):
-        family = "Helvetica Neue"
         avail = set(tkfont.families())
-        if family not in avail:
-            family = "Helvetica" if "Helvetica" in avail else "TkDefaultFont"
+        family = "TkDefaultFont"
+        for candidate in ("Segoe UI Variable", "Segoe UI", "SF Pro Text",
+                          "Helvetica Neue", "Helvetica", "Arial"):
+            if candidate in avail:
+                family = candidate
+                break
         self.f_base = tkfont.Font(family=family, size=13)
         self.f_small = tkfont.Font(family=family, size=11)
         self.f_bold = tkfont.Font(family=family, size=13, weight="bold")
@@ -192,7 +256,7 @@ class App(tk.Tk):
 
         # Tabelle
         style.configure("Treeview", background=CARD, fieldbackground=CARD,
-                        foreground=TEXT, rowheight=30, font=self.f_row,
+                        foreground=TEXT, rowheight=32, font=self.f_row,
                         bordercolor=BORDER, borderwidth=0)
         style.map("Treeview", background=[("selected", SEL)],
                   foreground=[("selected", TEXT)])
@@ -215,14 +279,10 @@ class App(tk.Tk):
                     pass
 
     # ------------------------------------------------------------------ UI
-    def _card(self, parent, pad=14):
-        """Weiße Karte mit dünnem Rahmen als Container."""
-        outer = tk.Frame(parent, bg=BORDER)
-        inner = tk.Frame(outer, bg=CARD)
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
-        body = tk.Frame(inner, bg=CARD)
-        body.pack(fill="both", expand=True, padx=pad, pady=pad)
-        return outer, body
+    def _card(self, parent, pad=16, expand=False, radius=14):
+        """Weiße Karte mit abgerundeten Ecken und dezentem Schatten."""
+        card = RoundedCard(parent, pad=pad, radius=radius, expand=expand)
+        return card, card.body
 
     def _build_ui(self):
         # --- Kopfbanner ------------------------------------------------
@@ -245,11 +305,11 @@ class App(tk.Tk):
         self.btn_update.pack(side="right", padx=(0, 12))
 
         wrap = tk.Frame(self, bg=BG)
-        wrap.pack(fill="both", expand=True, padx=14, pady=12)
+        wrap.pack(fill="both", expand=True, padx=18, pady=16)
 
         # --- Kundendaten ----------------------------------------------
         c1, b1 = self._card(wrap)
-        c1.pack(fill="x", pady=(0, 10))
+        c1.pack(fill="x", pady=(0, 14))
         ttk.Label(b1, text="Kundendaten (optional)", style="CardTitle.TLabel").grid(
             row=0, column=0, columnspan=8, sticky="w", pady=(0, 8))
         self.var_kunde = tk.StringVar()
@@ -269,7 +329,7 @@ class App(tk.Tk):
 
         # --- Scan-Einstellungen ---------------------------------------
         c2, b2 = self._card(wrap)
-        c2.pack(fill="x", pady=(0, 10))
+        c2.pack(fill="x", pady=(0, 14))
         ttk.Label(b2, text="Scan", style="CardTitle.TLabel").grid(
             row=0, column=0, columnspan=8, sticky="w", pady=(0, 8))
         ttk.Label(b2, text="Netzbereich (CIDR)").grid(row=1, column=0, sticky="w", padx=(0, 6))
@@ -324,7 +384,7 @@ class App(tk.Tk):
         self.btn_export.pack(side="right")
 
         # --- Ergebnis-Tabelle -----------------------------------------
-        c3, b3 = self._card(wrap, pad=1)
+        c3, b3 = self._card(wrap, pad=4, expand=True)
         c3.pack(fill="both", expand=True)
 
         filter_row = tk.Frame(b3, bg=CARD)
@@ -346,9 +406,11 @@ class App(tk.Tk):
                 self.tree.heading(key, text=label, command=lambda k=key: self._sort_by(k))
             self.tree.column(key, width=width, anchor=anchor,
                              stretch=(key in ("device", "hostname", "vendor")))
+        self._col_labels = {k: label for k, label, *_ in TREE_COLUMNS}
         self.tree.tag_configure("odd", background=CARD)
         self.tree.tag_configure("even", background=STRIPE)
         self.tree.tag_configure("muted", foreground=MUTED)
+        self.tree.tag_configure("hover", background=HOVER)
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -545,7 +607,17 @@ class App(tk.Tk):
 
         self.hosts.sort(key=sort_key, reverse=reverse)
         self._sort_state[key] = not reverse
+        self._sort_col, self._sort_dir = key, reverse
+        self._update_sort_headers()
         self._rebuild_tree()
+
+    def _update_sort_headers(self):
+        for key, label in self._col_labels.items():
+            if key == "icon":
+                continue
+            if key == self._sort_col:
+                label += " ▼" if self._sort_dir else " ▲"
+            self.tree.heading(key, text=label)
 
     def _on_double_click(self, event):
         item = self.tree.identify_row(event.y)
@@ -624,10 +696,23 @@ class App(tk.Tk):
         h = self._item_host.get(item) if item else None
         self.var_status.set(h.scan_warning if (h and h.scan_warning) else self._last_status)
         self.tree.configure(cursor="hand2" if (h and self._has_web_port(h)) else "")
+        self._set_hover(item)
 
     def _on_tree_leave(self, event):
         self.var_status.set(self._last_status)
         self.tree.configure(cursor="")
+        self._set_hover(None)
+
+    def _set_hover(self, item):
+        if item == self._hover_item:
+            return
+        if self._hover_item and self.tree.exists(self._hover_item):
+            tags = tuple(t for t in self.tree.item(self._hover_item, "tags") if t != "hover")
+            self.tree.item(self._hover_item, tags=tags)
+        if item:
+            tags = tuple(t for t in self.tree.item(item, "tags") if t != "hover") + ("hover",)
+            self.tree.item(item, tags=tags)
+        self._hover_item = item
 
     def _update_summary(self):
         from collections import Counter
