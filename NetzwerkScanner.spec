@@ -30,9 +30,14 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=["openpyxl", "tkinter"],
+    hiddenimports=["openpyxl", "tkinter", "msoffcrypto", "olefile",
+                   "cryptography", "cryptography.hazmat.backends.openssl"],
     hookspath=[],
     runtime_hooks=[],
+    # cffi wird von cryptography.hazmat.primitives.serialization tatsächlich
+    # gebraucht (nicht nur deklariert). build.sh ersetzt die von pip installierte
+    # Einzel-Architektur-Erweiterung durch eine per lipo zusammengeführte
+    # universal2-Version, siehe dortiger Kommentar.
     excludes=["numpy", "pandas", "matplotlib", "PIL", "scipy"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

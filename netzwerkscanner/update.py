@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,19 @@ REPO = "klopsnic-cyber/netzwerk-scanner"
 API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 
 ProgressCb = Optional[Callable[[float, str], None]]
+
+# Die App wird mit python.org-Python gebaut (siehe CLAUDE.md Punkt 1, für
+# Intel+ARM-Portabilität nötig). Dieses Python bringt anders als Apples
+# System-Python KEIN eigenes Root-Zertifikatsbündel mit - ohne den manuellen
+# Schritt "Install Certificates.command" schlägt JEDE HTTPS-Anfrage mit
+# CERTIFICATE_VERIFY_FAILED fehl (reproduziert). macOS liefert aber immer ein
+# System-Bündel unter /etc/ssl/cert.pem mit; das nutzen wir explizit statt
+# uns auf Pythons (kaputten) Default zu verlassen.
+def _ssl_context() -> ssl.SSLContext:
+    cafile = "/etc/ssl/cert.pem"
+    if os.path.exists(cafile):
+        return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
 
 
 class UpdateInfo(TypedDict):
@@ -47,20 +61,16 @@ def _parse_version(tag: str) -> tuple:
     return tuple(result)
 
 
-def check_for_update(timeout: float = 5.0) -> Optional[UpdateInfo]:
-    """Fragt die neueste GitHub-Release ab. None bei Fehler oder kein Update.
-
-    Netzwerkfehler (kein Internet, GitHub down, o.ä.) sind hier normal -
-    kein Grund die App zu stören, daher wird jede Exception geschluckt.
-    """
+def _fetch_latest_release(timeout: float) -> Optional[UpdateInfo]:
+    """Fragt die neueste GitHub-Release ab. None bei "kein Update" (Tag <=
+    eigene Version). Wirft bei Netzwerk-/API-Fehlern (kein Internet, GitHub
+    nicht erreichbar, Rate-Limit, kaputte Antwort) - der Aufrufer entscheidet,
+    ob das still ignoriert oder dem Nutzer angezeigt wird."""
     req = urllib.request.Request(
         API_URL, headers={"Accept": "application/vnd.github+json",
                            "User-Agent": f"Netzwerk-Scanner/{__version__}"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.load(resp)
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return None
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+        data = json.load(resp)
 
     tag = data.get("tag_name", "")
     if _parse_version(tag) <= _parse_version(__version__):
@@ -74,6 +84,24 @@ def check_for_update(timeout: float = 5.0) -> Optional[UpdateInfo]:
 
     return UpdateInfo(version=tag.lstrip("vV"), url=data.get("html_url", ""),
                        notes=(data.get("body") or "").strip(), asset_url=asset_url)
+
+
+def check_for_update(timeout: float = 5.0) -> Optional[UpdateInfo]:
+    """Fragt die neueste GitHub-Release ab. None bei Fehler ODER kein Update -
+    für den stillen Check beim App-Start (ein Netzwerkfehler ist dort normal,
+    kein Grund die App zu stören). Für den manuellen "Jetzt prüfen"-Klick
+    stattdessen check_for_update_or_raise() nutzen, damit ein echter
+    Fehlschlag nicht fälschlich als "kein Update" erscheint."""
+    try:
+        return _fetch_latest_release(timeout)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+
+def check_for_update_or_raise(timeout: float = 5.0) -> Optional[UpdateInfo]:
+    """Wie check_for_update(), wirft aber bei Netzwerk-/API-Fehlern statt
+    still None zu liefern."""
+    return _fetch_latest_release(timeout)
 
 
 def current_app_bundle() -> str:
@@ -114,7 +142,7 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
         info["asset_url"],
         headers={"User-Agent": f"Netzwerk-Scanner/{__version__}",
                  "Accept": "application/octet-stream"})
-    with urllib.request.urlopen(req, timeout=30) as resp, open(tmp_dmg, "wb") as f:
+    with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp, open(tmp_dmg, "wb") as f:
         total = int(resp.headers.get("Content-Length", 0)) or None
         done = 0
         last_reported = -1.0

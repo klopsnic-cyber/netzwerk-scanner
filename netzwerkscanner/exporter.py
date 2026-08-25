@@ -16,6 +16,7 @@ import sys
 from copy import copy
 from typing import List, Optional
 
+import msoffcrypto
 import openpyxl
 from openpyxl.styles import Alignment, Border, Side
 
@@ -72,7 +73,7 @@ def _load_template_workbook(template_path: Optional[str]):
 def export(hosts: List[Host], out_path: str,
            template_path: Optional[str] = None,
            kundenname: str = "", kundennummer: str = "",
-           installationsdatum: str = "") -> str:
+           installationsdatum: str = "", passwort: str = "") -> str:
     """Füllt die Vorlage und speichert sie unter out_path. Gibt out_path zurück."""
     hosts = [h for h in hosts if not h.ignored]
     wb = _load_template_workbook(template_path)
@@ -99,7 +100,20 @@ def export(hosts: List[Host], out_path: str,
         row += 1
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    wb.save(out_path)
+
+    if passwort:
+        # Echte Verschlüsselung (ECMA-376 Agile, AES-256) - identisch zu
+        # Excel "Datei -> Informationen -> Mit Kennwort verschlüsseln":
+        # Datei lässt sich ohne Kennwort gar nicht erst öffnen.
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        office = msoffcrypto.OfficeFile(buf)
+        with open(out_path, "wb") as f:
+            office.encrypt(passwort, f)
+    else:
+        wb.save(out_path)
+
     return out_path
 
 

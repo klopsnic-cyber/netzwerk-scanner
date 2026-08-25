@@ -237,16 +237,21 @@ class App(tk.Tk):
         c1, b1 = self._card(wrap)
         c1.pack(fill="x", pady=(0, 10))
         ttk.Label(b1, text="Kundendaten (optional)", style="CardTitle.TLabel").grid(
-            row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
+            row=0, column=0, columnspan=8, sticky="w", pady=(0, 8))
         self.var_kunde = tk.StringVar()
         self.var_kundennr = tk.StringVar()
         self.var_datum = tk.StringVar(value=datetime.date.today().strftime("%d.%m.%Y"))
+        self.var_passwort = tk.StringVar()
         ttk.Label(b1, text="Kundenname").grid(row=1, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(b1, textvariable=self.var_kunde, width=26).grid(row=1, column=1, padx=(0, 16))
         ttk.Label(b1, text="Tomedo Kundennr.").grid(row=1, column=2, sticky="w", padx=(0, 6))
         ttk.Entry(b1, textvariable=self.var_kundennr, width=16).grid(row=1, column=3, padx=(0, 16))
         ttk.Label(b1, text="Installationsdatum").grid(row=1, column=4, sticky="w", padx=(0, 6))
-        ttk.Entry(b1, textvariable=self.var_datum, width=14).grid(row=1, column=5)
+        ttk.Entry(b1, textvariable=self.var_datum, width=14).grid(row=1, column=5, padx=(0, 16))
+        ttk.Label(b1, text="Passwort").grid(row=1, column=6, sticky="w", padx=(0, 6))
+        ttk.Entry(b1, textvariable=self.var_passwort, width=16, show="•").grid(row=1, column=7)
+        ttk.Label(b1, text="Verschlüsselt die exportierte Excel-Datei mit diesem Kennwort (Passwortabfrage beim Öffnen), wenn ausgefüllt.",
+                 style="Muted.TLabel").grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
 
         # --- Scan-Einstellungen ---------------------------------------
         c2, b2 = self._card(wrap)
@@ -460,7 +465,7 @@ class App(tk.Tk):
             exporter.export(
                 self.hosts, path, template_path=self.template_path,
                 kundenname=self.var_kunde.get(), kundennummer=self.var_kundennr.get(),
-                installationsdatum=self.var_datum.get())
+                installationsdatum=self.var_datum.get(), passwort=self.var_passwort.get())
         except Exception as e:
             messagebox.showerror("Export fehlgeschlagen", str(e))
             return
@@ -645,7 +650,7 @@ class App(tk.Tk):
                     messagebox.showerror("Scan-Fehler", item[1])
                     self._finish_scan()
                 elif kind == "update":
-                    self._on_update_result(item[1], manual=item[2])
+                    self._on_update_result(item[1], manual=item[2], error=item[3])
                 elif kind == "install_progress":
                     _, frac, msg = item
                     self.btn_update.config(text=msg)
@@ -659,8 +664,19 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ Update
     def _check_update_bg(self, manual: bool = False):
-        info = update_check.check_for_update()
-        self.msg_queue.put(("update", info, manual))
+        # Beim stillen Auto-Check (Programmstart) ist ein Netzwerkfehler
+        # normal und wird ignoriert. Beim manuellen Klick soll ein echter
+        # Fehlschlag NICHT als "kein Update" erscheinen, sondern angezeigt
+        # werden - sonst denkt der Nutzer fälschlich, er sei aktuell.
+        if manual:
+            try:
+                info = update_check.check_for_update_or_raise()
+                self.msg_queue.put(("update", info, manual, None))
+            except Exception as e:
+                self.msg_queue.put(("update", None, manual, str(e)))
+        else:
+            info = update_check.check_for_update()
+            self.msg_queue.put(("update", info, manual, None))
 
     def _on_update_click(self):
         if self._update_info:
@@ -669,13 +685,21 @@ class App(tk.Tk):
         self.btn_update.config(text="Prüfe …", state="disabled")
         threading.Thread(target=self._check_update_bg, args=(True,), daemon=True).start()
 
-    def _on_update_result(self, info: Optional[dict], manual: bool):
+    def _on_update_result(self, info: Optional[dict], manual: bool, error: Optional[str] = None):
         self.btn_update.config(state="normal")
         if info:
             self._update_info = info
             self.btn_update.config(text=f"Update verfügbar: v{info['version']}",
                                    bg="#FFC942", fg="#3A2A00",
                                    activebackground="#F5B900")
+        elif manual and error:
+            self.btn_update.config(text=f"v{__version__} · Prüfung fehlgeschlagen")
+            messagebox.showwarning(
+                "Update-Prüfung fehlgeschlagen",
+                f"GitHub konnte nicht erreicht werden:\n{error}\n\n"
+                "Kein Internet, oder GitHub gerade nicht erreichbar.")
+            self.after(3000, lambda: self.btn_update.config(
+                text=f"v{__version__} · Nach Updates suchen"))
         elif manual:
             self.btn_update.config(text=f"v{__version__} · aktuell")
             self.after(3000, lambda: self.btn_update.config(

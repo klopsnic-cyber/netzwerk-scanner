@@ -100,9 +100,20 @@ python3 app.py --cli 192.168.1.0/24  # reiner Terminal-Scan (umgeht die
 ## Bedienung
 
 1. Netzbereich prüfen (wird automatisch erkannt, z.B. `192.168.1.0/24`).
-2. Optional Kundenname / Tomedo-Nummer / Datum eintragen.
+2. Optional Kundenname / Tomedo-Nummer / Datum eintragen; optional ein
+   Passwort für die exportierte Excel-Datei (siehe unten).
 3. **Scan starten** – Geräte erscheinen live in der Tabelle.
 4. **In Excel exportieren** – erzeugt eine ausgefüllte Kopie der Vorlage.
+
+### Exportierte Excel-Datei verschlüsseln (optional)
+
+Wird im Feld „Passwort" ein Kennwort eingetragen, wird die exportierte
+`.xlsx`-Datei damit verschlüsselt (ECMA-376 Agile/AES-256 – dasselbe Format
+wie Excel „Datei → Informationen → Mit Kennwort verschlüsseln"). Die Datei
+lässt sich dann ohne das Kennwort gar nicht erst öffnen. Bleibt das Feld
+leer, wird ganz normal unverschlüsselt exportiert. Das Passwort wird nicht
+in der Sitzung gespeichert (wie beim Geräte-Kennwortfeld, aus dem gleichen
+Grund: keine Klartext-Passwörter in App/JSON).
 
 ### Tabelle bearbeiten (Rechtsklick)
 

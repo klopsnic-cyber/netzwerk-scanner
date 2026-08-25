@@ -12,7 +12,7 @@ import sys
 
 
 def run_cli(cidr: str, depth: str, out: str, template: str,
-            kunde: str, kundennr: str, datum: str):
+            kunde: str, kundennr: str, datum: str, passwort: str = ""):
     from netzwerkscanner import exporter
     from netzwerkscanner.scanner import ScanConfig, Scanner
 
@@ -29,7 +29,7 @@ def run_cli(cidr: str, depth: str, out: str, template: str,
     out = out or exporter.suggested_filename(kunde)
     path = exporter.export(hosts, out, template_path=template or None,
                            kundenname=kunde, kundennummer=kundennr,
-                           installationsdatum=datum)
+                           installationsdatum=datum, passwort=passwort)
     print(f"\nExportiert nach: {path}")
 
 
@@ -43,11 +43,12 @@ def main():
     parser.add_argument("--kunde", default="")
     parser.add_argument("--kundennr", default="")
     parser.add_argument("--datum", default="")
+    parser.add_argument("--passwort", default="", help="Verschlüsselt die exportierte .xlsx mit diesem Kennwort")
     args = parser.parse_args()
 
     if args.cli:
         run_cli(args.cli, args.depth, args.out, args.template,
-                args.kunde, args.kundennr, args.datum)
+                args.kunde, args.kundennr, args.datum, args.passwort)
     else:
         from netzwerkscanner.gui import main as gui_main
         gui_main()

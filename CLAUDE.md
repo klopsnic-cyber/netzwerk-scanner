@@ -99,6 +99,33 @@ NetzwerkScanner.spec       PyInstaller-Konfiguration
     lauffähig. Release veröffentlichen: Version in `__init__.py` erhöhen,
     `./build.sh`, dann `gh release create vX.Y.Z Netzwerk-Scanner.dmg`.
 
+11. **python.org-Python hat KEIN eigenes Root-Zertifikatsbündel** (anders als
+    Apples System-Python). Ohne den manuellen Schritt „Install
+    Certificates.command" schlägt JEDE HTTPS-Anfrage per `urllib` mit
+    `CERTIFICATE_VERIFY_FAILED` fehl – reproduziert, war der eigentliche Grund
+    warum der Update-Check auf einem anderen Gerät nichts fand (Fehler wurde
+    still verschluckt statt angezeigt). macOS liefert aber immer ein
+    System-Bündel unter `/etc/ssl/cert.pem` mit; `update.py` baut daraus
+    explizit einen `ssl.SSLContext` (`_ssl_context()`) und übergibt ihn an
+    jeden `urlopen()`-Aufruf, statt sich auf Pythons kaputten Default zu
+    verlassen. Bei künftigen `urllib`-Aufrufen im Projekt IMMER `_ssl_context()`
+    mitgeben (oder das gleiche Muster wiederholen).
+
+12. **Excel-Export-Verschlüsselung** (`exporter.py`, Feld „Passwort" in der
+    GUI). Echte Verschlüsselung mit Öffnen-Passwort (ECMA-376 Agile/AES-256) -
+    NICHT zu verwechseln mit `openpyxl`s `WorkbookProtection`
+    („Arbeitsmappe schützen", schützt nur die Struktur, kein Öffnen-Kennwort,
+    wurde hier bewusst NICHT verwendet). Braucht `msoffcrypto-tool`
+    (→ `cryptography` + `olefile`). `cryptography` hat ein universal2-Wheel
+    auf PyPI, seine transitive Abhängigkeit `cffi` (wird von
+    `cryptography.hazmat.primitives.serialization` tatsächlich gebraucht,
+    nicht nur deklariert) NICHT – `build.sh` lädt daher beide
+    Einzel-Architektur-Wheels (gleiche Version!) und führt die kompilierte
+    Erweiterung selbst per `lipo -create` zusammen. Ohne diesen Schritt
+    entweder Build-Fehler „is not a fat binary!“ (PyInstaller bei
+    `target_arch=universal2`) oder `ModuleNotFoundError: _cffi_backend` zur
+    Laufzeit, je nachdem ob man das Modul stattdessen ausschließt.
+
 ## Eingebettete Daten neu erzeugen
 - OUI: `python3 assets/make_oui_data.py` (nach Aktualisieren von `data/oui.csv`)
 - Vorlage: aus data/Netzwerkdoku-Vorlage.xlsx per base64 nach template_data.py

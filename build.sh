@@ -88,6 +88,63 @@ source "$VENV/bin/activate"
 pip install --upgrade pip >/dev/null
 pip install -r requirements.txt
 
+# 'cryptography' (für die Excel-Verschlüsselung) hat eine kompilierte
+# Rust-Erweiterung - "pip install" liefert normal nur die Architektur DIESES
+# Macs aus. Für einen portablen Build brauchen wir das universal2-Wheel
+# (Intel + Apple Silicon in einer Datei), sonst crasht die App auf der
+# jeweils anderen Architektur (gleiches Problem wie bei Python selbst,
+# siehe Punkt 1 oben).
+if [ "$PORTABLE" = "1" ]; then
+  echo "    Erzwinge universal2-Wheel für 'cryptography' (Intel + Apple Silicon)…"
+  PYVER=$("$PYBIN" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+  TMPWHL=$(mktemp -d)
+  if pip download cryptography --no-deps --only-binary=:all: \
+      --platform macosx_11_0_universal2 --python-version "$PYVER" --implementation cp \
+      -d "$TMPWHL" >/dev/null 2>&1; then
+    pip install --force-reinstall --no-deps "$TMPWHL"/cryptography-*.whl
+  else
+    echo "    WARNUNG: Kein universal2-Wheel für 'cryptography' gefunden -"
+    echo "    Verschlüsselungsfunktion läuft dann nur auf $(uname -m)-Macs."
+  fi
+  rm -rf "$TMPWHL"
+
+  # 'cffi' (transitive Abhängigkeit von cryptography, wird von dessen
+  # Serialisierungs-Code tatsächlich gebraucht) hat KEIN universal2-Wheel auf
+  # PyPI. Lösung: beide Einzel-Architektur-Wheels laden und die kompilierte
+  # Erweiterung selbst per 'lipo' zusammenführen (Standardtechnik für genau
+  # diesen Fall - so bauen z.B. auch python.org/Homebrew ihre universal2-Pakete).
+  echo "    Erzwinge universal2 für 'cffi' (per lipo aus Einzel-Architektur-Wheels)…"
+  CFFI_VER=$(python -c "import cffi; print(cffi.__version__)" 2>/dev/null || true)
+  if [ -n "$CFFI_VER" ]; then
+    TMPCFFI=$(mktemp -d)
+    OK=1
+    pip download "cffi==$CFFI_VER" --no-deps --only-binary=:all: \
+      --platform macosx_11_0_arm64 --python-version "$PYVER" --implementation cp \
+      -d "$TMPCFFI/arm64" >/dev/null 2>&1 || OK=0
+    pip download "cffi==$CFFI_VER" --no-deps --only-binary=:all: \
+      --platform macosx_11_0_x86_64 --python-version "$PYVER" --implementation cp \
+      -d "$TMPCFFI/x86_64" >/dev/null 2>&1 || OK=0
+    if [ "$OK" = "1" ]; then
+      unzip -o -q "$TMPCFFI"/arm64/*.whl -d "$TMPCFFI/arm64/x"
+      unzip -o -q "$TMPCFFI"/x86_64/*.whl -d "$TMPCFFI/x86_64/x"
+      ARM_SO=$(find "$TMPCFFI/arm64/x" -name "_cffi_backend*.so" | head -1)
+      X86_SO=$(find "$TMPCFFI/x86_64/x" -name "_cffi_backend*.so" | head -1)
+      TARGET_SO=$(find "$VENV" -name "_cffi_backend*.so" | head -1)
+      if [ -n "$ARM_SO" ] && [ -n "$X86_SO" ] && [ -n "$TARGET_SO" ]; then
+        lipo -create "$ARM_SO" "$X86_SO" -output "$TARGET_SO"
+        echo "    universal2 _cffi_backend erzeugt ($(lipo -archs "$TARGET_SO"))."
+      else
+        echo "    WARNUNG: _cffi_backend*.so nicht gefunden - Verschlüsselung läuft"
+        echo "    dann nur auf $(uname -m)-Macs."
+      fi
+    else
+      echo "    WARNUNG: cffi==$CFFI_VER nicht für beide Architekturen verfügbar -"
+      echo "    Verschlüsselungsfunktion läuft dann nur auf $(uname -m)-Macs."
+    fi
+    rm -rf "$TMPCFFI"
+  fi
+fi
+
 echo "==> 2/6  OUI-Herstellerliste aktualisieren (fest eingebettet)"
 mkdir -p data
 # Offizielle IEEE-Liste laden (nur um die eingebettete Liste zu aktualisieren).
