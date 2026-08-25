@@ -1,0 +1,63 @@
+name: Windows-Build
+
+# Baut die Windows-.exe. MUSS auf einem Windows-Runner laufen - PyInstaller
+# kann nicht von macOS aus für Windows cross-kompilieren.
+#
+# Läuft automatisch bei jedem "vX.Y.Z"-Tag (also bei jedem
+# "gh release create vX.Y.Z ...") und hängt die .zip direkt an die Release
+# an. Manuell auslösbar über workflow_dispatch, optional mit Ziel-Tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release-Tag zum Anhängen (z.B. v1.2.0). Leer = nur als Artifact.'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pillow
+
+      - name: Icon erzeugen
+        run: python assets/make_icon.py assets
+
+      - name: Mit PyInstaller bauen
+        run: pyinstaller NetzwerkScannerWindows.spec
+
+      - name: Build zippen
+        shell: pwsh
+        run: Compress-Archive -Path dist/Netzwerk-Scanner -DestinationPath Netzwerk-Scanner-Windows.zip
+
+      - name: Als Artifact hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Netzwerk-Scanner-Windows
+          path: Netzwerk-Scanner-Windows.zip
+
+      - name: An Release anhängen
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ -n "${{ inputs.tag }}" ]; then TAG="${{ inputs.tag }}"; fi
+          gh release upload "$TAG" Netzwerk-Scanner-Windows.zip --clobber --repo "$GITHUB_REPOSITORY"

@@ -20,6 +20,7 @@ data/oui.csv
 # Generierte Icon-Artefakte (aus assets/make_icon.py beim Build)
 assets/Netzwerk-Scanner.iconset/
 assets/Netzwerk-Scanner.icns
+assets/Netzwerk-Scanner.ico
 assets/preview.png
 assets/app_icon.png
 

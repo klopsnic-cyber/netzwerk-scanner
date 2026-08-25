@@ -51,7 +51,10 @@ DEPTH_ORDER = ["schnell", "standard", "gruendlich"]
 WEB_PORTS = {80, 443, 8080, 8443}
 
 # Session-Persistenz (letzter Scan wird beim Beenden gesichert).
-SESSION_DIR = os.path.expanduser("~/Library/Application Support/Netzwerk-Scanner")
+if sys.platform == "win32":
+    SESSION_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Netzwerk-Scanner")
+else:
+    SESSION_DIR = os.path.expanduser("~/Library/Application Support/Netzwerk-Scanner")
 SESSION_FILE = os.path.join(SESSION_DIR, "last_session.json")
 
 # Spalten: (key, Überschrift, Breite, Ausrichtung)
@@ -65,6 +68,17 @@ TREE_COLUMNS = [
     ("winfunc", "Windows-Funktion", 150, "w"),
     ("ports", "Offene Ports", 150, "w"),
 ]
+
+
+def reveal_in_file_manager(path: str):
+    """Zeigt eine Datei im Finder (macOS) bzw. Explorer (Windows) an."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["explorer", f"/select,{path}"])
+        else:
+            subprocess.run(["open", "-R", path])
+    except Exception:
+        pass
 
 
 def device_emoji(device_type: str, os_hint: str = "") -> str:
@@ -471,10 +485,7 @@ class App(tk.Tk):
             return
         if messagebox.askyesno("Fertig",
                                f"Gespeichert:\n{path}\n\nIm Finder anzeigen?"):
-            try:
-                subprocess.run(["open", "-R", path])
-            except Exception:
-                pass
+            reveal_in_file_manager(path)
 
     # ------------------------------------------------------- Tabelle/Events
     def _row_values(self, h: Host):
@@ -542,10 +553,7 @@ class App(tk.Tk):
         if not h or not self._has_web_port(h):
             return
         scheme = "https" if (443 in h.open_ports or 8443 in h.open_ports) else "http"
-        try:
-            subprocess.run(["open", f"{scheme}://{h.ip}"])
-        except Exception:
-            pass
+        webbrowser.open(f"{scheme}://{h.ip}")
 
     def _show_context_menu(self, event):
         item = self.tree.identify_row(event.y)
@@ -708,6 +716,12 @@ class App(tk.Tk):
 
     def _confirm_and_install(self):
         info = self._update_info
+        if sys.platform != "darwin":
+            # Automatisches Ersetzen ist macOS-spezifisch (.app-Bundle,
+            # hdiutil/ditto). Auf Windows bleibt es beim sicheren Rückfall:
+            # Release-Seite öffnen, Installer manuell ausführen.
+            webbrowser.open(info["url"])
+            return
         notes = f"\n\n{info['notes']}" if info.get("notes") else ""
         if not messagebox.askyesno(
                 "Update installieren",

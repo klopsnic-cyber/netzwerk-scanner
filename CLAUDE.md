@@ -126,6 +126,20 @@ NetzwerkScanner.spec       PyInstaller-Konfiguration
     `target_arch=universal2`) oder `ModuleNotFoundError: _cffi_backend` zur
     Laufzeit, je nachdem ob man das Modul stattdessen ausschließt.
 
+13. **Windows-Version via GitHub Actions.** PyInstaller kann nicht von macOS
+    aus für Windows cross-kompilieren - `.github/workflows/build-windows.yml`
+    baut auf einem echten `windows-latest`-Runner mit
+    `NetzwerkScannerWindows.spec` (kein `.app`/`BUNDLE`/universal2-Kram nötig,
+    Windows ist single-arch und `cryptography` hat dort ein normales Wheel
+    inkl. `cffi` - der lipo-Merge aus Punkt 12 ist rein macOS-spezifisch).
+    Läuft automatisch bei jedem `vX.Y.Z`-Tag (= bei jedem
+    `gh release create`) und hängt `Netzwerk-Scanner-Windows.zip` an dieselbe
+    Release an; manuell testbar über `gh workflow run build-windows.yml -f
+    tag=vX.Y.Z`. Auto-Update installiert auf Windows NICHT automatisch
+    (`gui.py`: `sys.platform != "darwin"` → Rückfall auf Release-Seite im
+    Browser) - das Ersetzen einer laufenden `.exe` ist unter Windows riskanter
+    als unter POSIX (Windows sperrt offene Dateien).
+
 ## Eingebettete Daten neu erzeugen
 - OUI: `python3 assets/make_oui_data.py` (nach Aktualisieren von `data/oui.csv`)
 - Vorlage: aus data/Netzwerkdoku-Vorlage.xlsx per base64 nach template_data.py

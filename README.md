@@ -1,9 +1,22 @@
 # Netzwerk-Scanner (Tomedo-Netzwerkdoku)
 
-Ein IP-Scanner für macOS, der das lokale Netzwerk durchsucht und die
-gefundenen Geräte automatisch in die Excel-Vorlage `Netzwerkdoku-Vorlage.xlsx`
-einträgt. Felder, die sich technisch nicht ermitteln lassen, bleiben leer und
-werden von Hand ergänzt.
+Ein IP-Scanner für macOS und Windows, der das lokale Netzwerk durchsucht und
+die gefundenen Geräte automatisch in die Excel-Vorlage
+`Netzwerkdoku-Vorlage.xlsx` einträgt. Felder, die sich technisch nicht
+ermitteln lassen, bleiben leer und werden von Hand ergänzt.
+
+## Windows-Version
+
+Wird automatisch per GitHub Actions gebaut (`.github/workflows/build-windows.yml`,
+läuft auf einem echten Windows-Runner - PyInstaller kann nicht von macOS aus
+für Windows cross-kompilieren) und bei jedem Release als
+`Netzwerk-Scanner-Windows.zip` angehängt: <https://github.com/klopsnic-cyber/netzwerk-scanner/releases/latest>.
+Entpacken, `Netzwerk-Scanner.exe` starten - kein Installer nötig.
+
+Unterschiede zur Mac-Version: Der Update-Button installiert Updates nicht
+automatisch (das Ersetzen der laufenden Datei ist auf Windows riskanter, da
+Windows die Datei sperrt solange sie läuft) - er öffnet stattdessen die
+Release-Seite zum manuellen Herunterladen.
 
 Merkmale: modernes Oberflächen-Theme mit eigenem App-Icon und Gerätetyp-Symbolen,
 aktive Erreichbarkeitsprüfung (nur Geräte, die zur Scan-Zeit antworten – kein

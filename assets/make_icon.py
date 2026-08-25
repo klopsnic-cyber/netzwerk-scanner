@@ -118,6 +118,10 @@ def main():
     # Vorschau + PNG für tk-Fenstersymbol
     render(512).save(os.path.join(out_dir, "preview.png"))
     render(256).save(os.path.join(out_dir, "app_icon.png"))
+    # .ico für die Windows-Version (Pillow kann das auf jedem Betriebssystem
+    # erzeugen, wird also auch vom macOS-build.sh mitgebaut).
+    render(512).save(os.path.join(out_dir, "Netzwerk-Scanner.ico"),
+                     sizes=[(16, 16), (32, 32), (48, 48), (128, 128), (256, 256)])
     print(f"Iconset erzeugt: {iconset}")
 
 
