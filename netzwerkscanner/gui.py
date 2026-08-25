@@ -206,8 +206,6 @@ class App(tk.Tk):
         self.f_base = tkfont.Font(family=family, size=13)
         self.f_small = tkfont.Font(family=family, size=11)
         self.f_bold = tkfont.Font(family=family, size=13, weight="bold")
-        self.f_title = tkfont.Font(family=family, size=20, weight="bold")
-        self.f_sub = tkfont.Font(family=family, size=12)
         self.f_row = tkfont.Font(family=family, size=12)
         self.f_head = tkfont.Font(family=family, size=12, weight="bold")
 
@@ -285,24 +283,16 @@ class App(tk.Tk):
         return card, card.body
 
     def _build_ui(self):
-        # --- Kopfbanner ------------------------------------------------
-        header = tk.Frame(self, bg=ACCENT, height=64)
+        # --- Kopfzeile (nur Update-Button) ------------------------------
+        header = tk.Frame(self, bg=BG)
         header.pack(fill="x")
-        header.pack_propagate(False)
-        tk.Label(header, text="Netzwerk-Scanner", bg=ACCENT, fg="#FFFFFF",
-                 font=self.f_title).pack(side="left", padx=20)
-        tk.Label(header, text="Netzwerkdoku automatisch erfassen",
-                 bg=ACCENT, fg="#DCEBFF", font=self.f_sub).pack(side="left", padx=4)
-        self.hdr_count = tk.Label(header, text="", bg=ACCENT, fg="#FFFFFF",
-                                  font=self.f_bold)
-        self.hdr_count.pack(side="right", padx=20)
         self._update_info = None  # gesetzt sobald ein Update gefunden wurde
         self.btn_update = tk.Button(
             header, text=f"v{__version__} · Nach Updates suchen", bg="#E7ECF4", fg=TEXT,
             activebackground="#D8E0EC", activeforeground=TEXT, relief="flat",
             font=self.f_small, padx=10, pady=3, cursor="hand2", bd=0, highlightthickness=0,
             command=self._on_update_click)
-        self.btn_update.pack(side="right", padx=(0, 12))
+        self.btn_update.pack(side="right", padx=18, pady=(12, 0))
 
         wrap = tk.Frame(self, bg=BG)
         wrap.pack(fill="both", expand=True, padx=18, pady=16)
@@ -590,7 +580,6 @@ class App(tk.Tk):
         ignored = sum(1 for h in self.hosts if h.ignored)
         text = f"{n} Geräte" + (f" ({ignored} ignoriert)" if ignored else "")
         self.var_count.set(text)
-        self.hdr_count.config(text=text)
 
     def _sort_by(self, key):
         idx = [c[0] for c in TREE_COLUMNS].index(key)
