@@ -18,6 +18,7 @@ from typing import List, Optional
 
 import msoffcrypto
 import openpyxl
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Side
 
 from .scanner import Host
@@ -60,10 +61,25 @@ def default_template_path() -> str:
     return EMBEDDED
 
 
+def _text(v):
+    """Werte aus dem Netz/der Eingabe sicher als Text: Steuerzeichen raus (sonst bricht der
+    ganze Export ab), und "=..." bleibt Text statt Excel-Formel."""
+    return ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
+
+
+def _set(ws, row, col, value):
+    cell = ws.cell(row=row, column=col, value=_text(value))
+    if isinstance(cell.value, str):
+        cell.data_type = "s"
+    return cell
+
+
 def _load_template_workbook(template_path: Optional[str]):
     """Lädt die Vorlage: eingebettete Version (Standard) oder eine vom
     Benutzer gewählte externe .xlsx-Datei."""
-    if template_path and template_path != EMBEDDED and os.path.exists(template_path):
+    if template_path and template_path != EMBEDDED:
+        if not os.path.exists(template_path):
+            raise FileNotFoundError(f"Vorlage nicht gefunden: {template_path}")
         return openpyxl.load_workbook(template_path)
     # Eingebettete Vorlage aus dem Code – immer verfügbar, ohne Zusatzdatei.
     data = base64.b64decode(TEMPLATE_B64)
@@ -81,11 +97,10 @@ def export(hosts: List[Host], out_path: str,
 
     # Kopfdaten (unter den Labels in Zeile 1 -> Zeile 2)
     if kundenname:
-        ws.cell(row=2, column=1, value=kundenname)
+        _set(ws, 2, 1, kundenname)
     if kundennummer:
-        ws.cell(row=2, column=2, value=kundennummer)
-    ws.cell(row=2, column=3,
-            value=installationsdatum or _dt.date.today().strftime("%d.%m.%Y"))
+        _set(ws, 2, 2, kundennummer)
+    _set(ws, 2, 3, installationsdatum or _dt.date.today().strftime("%d.%m.%Y"))
 
     # Randstil von der Überschrift übernehmen (für ein sauberes Tabellenbild)
     thin = Side(style="thin", color="BBBBBB")
@@ -94,10 +109,16 @@ def export(hosts: List[Host], out_path: str,
     row = FIRST_DATA_ROW
     for h in sorted(hosts, key=lambda x: x.sort_key()):
         for col, getter in COLUMN_MAP.items():
-            cell = ws.cell(row=row, column=col, value=getter(h) or None)
+            cell = _set(ws, row, col, getter(h) or None)
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=False)
         row += 1
+
+    # Excel-Tabelle der Vorlage auf alle Zeilen ausdehnen (sonst gelten Filter/Streifen nur für die ersten)
+    for tbl in ws.tables.values():
+        start, end = tbl.ref.split(":")
+        if start.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ") == str(HEADER_ROW):  # nur die Gerätetabelle
+            tbl.ref = f"{start}:{end.rstrip('0123456789')}{max(row - 1, FIRST_DATA_ROW)}"
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
@@ -109,10 +130,19 @@ def export(hosts: List[Host], out_path: str,
         wb.save(buf)
         buf.seek(0)
         office = msoffcrypto.OfficeFile(buf)
-        with open(out_path, "wb") as f:
-            office.encrypt(passwort, f)
-    else:
-        wb.save(out_path)
+    # Erst in eine Temp-Datei daneben, dann austauschen: bricht der Export ab,
+    # bleibt eine bestehende (ältere) Doku unter diesem Namen unversehrt.
+    tmp = out_path + ".tmp"
+    try:
+        if passwort:
+            with open(tmp, "wb") as f:
+                office.encrypt(passwort, f)
+        else:
+            wb.save(tmp)
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
     return out_path
 

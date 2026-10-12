@@ -19,7 +19,7 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import List, Optional
 
 from . import __app_name__, __version__
@@ -439,12 +439,19 @@ class App(tk.Tk):
             return
         cidr = self.var_cidr.get().strip()
         try:
-            ipaddress.ip_network(cidr, strict=False)
+            net = ipaddress.ip_network(cidr, strict=False)
         except ValueError:
             messagebox.showerror("Ungültiger Netzbereich",
                                  f"'{cidr}' ist kein gültiges CIDR-Netz (z.B. 192.168.1.0/24).")
             return
+        if net.version != 4 or net.prefixlen < 22:
+            messagebox.showerror("Netzbereich zu groß",
+                                 "Bitte ein IPv4-Netz bis höchstens /22 (1022 Adressen) angeben, "
+                                 "z.B. 192.168.1.0/24. Größere Netze in Teilen scannen.")
+            return
 
+        # Handeingaben (Standort, User, …, Ignorieren) bleiben beim erneuten Scan erhalten
+        self._manual = {h.ip: h for h in self.hosts}
         self.hosts = []
         self._item_host = {}
         self.tree.delete(*self.tree.get_children())
@@ -469,6 +476,14 @@ class App(tk.Tk):
 
         self.scan_thread = threading.Thread(target=worker, daemon=True)
         self.scan_thread.start()
+
+    MANUAL_FIELDS = ("standort", "user", "angebunden_an", "eingerichtet_von", "ignored")
+
+    def _carry_manual(self, h: Host):
+        old = getattr(self, "_manual", {}).get(h.ip)
+        if old is not None and old is not h:
+            for f in self.MANUAL_FIELDS:
+                setattr(h, f, getattr(old, f))
 
     def _cancel_scan(self):
         if self.scanner:
@@ -527,16 +542,33 @@ class App(tk.Tk):
             initialfile=fname, filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
+        pw = self.var_passwort.get()
+        if pw:
+            again = simpledialog.askstring("Passwort bestätigen",
+                                           "Passwort für die Excel-Datei bitte wiederholen:",
+                                           show="•", parent=self)
+            if again is None:
+                return
+            if again != pw:
+                messagebox.showerror("Passwort", "Die Passwörter stimmen nicht überein. Nichts gespeichert.")
+                return
         try:
             exporter.export(
                 self.hosts, path, template_path=self.template_path,
                 kundenname=self.var_kunde.get(), kundennummer=self.var_kundennr.get(),
-                installationsdatum=self.var_datum.get(), passwort=self.var_passwort.get())
+                installationsdatum=self.var_datum.get(), passwort=pw)
+        except PermissionError:
+            messagebox.showerror("Export fehlgeschlagen",
+                                 "Die Datei ist vermutlich noch in Excel geöffnet oder schreibgeschützt.\n"
+                                 "Bitte schließen und erneut speichern.")
+            return
         except Exception as e:
             messagebox.showerror("Export fehlgeschlagen", str(e))
             return
+        art = "verschlüsselt mit Passwort" if pw else "ohne Passwort"
+        manager = "Finder" if sys.platform == "darwin" else "Explorer"
         if messagebox.askyesno("Fertig",
-                               f"Gespeichert:\n{path}\n\nIm Finder anzeigen?"):
+                               f"Gespeichert ({art}):\n{path}\n\nIm {manager} anzeigen?"):
             reveal_in_file_manager(path)
 
     # ------------------------------------------------------- Tabelle/Events
@@ -626,6 +658,10 @@ class App(tk.Tk):
         self.tree.selection_set(item)
         menu = tk.Menu(self, tearoff=0)
         menu.add_command(label="Bearbeiten…", command=lambda: self._edit_host(h))
+        menu.add_command(label="IP kopieren", command=lambda: (self.clipboard_clear(), self.clipboard_append(h.ip)))
+        if self._has_web_port(h):
+            scheme = "https" if (443 in h.open_ports or 8443 in h.open_ports) else "http"
+            menu.add_command(label="Im Browser öffnen", command=lambda: webbrowser.open(f"{scheme}://{h.ip}"))
         label = "Nicht mehr ignorieren" if h.ignored else "Ignorieren"
         menu.add_command(label=label, command=lambda: self._toggle_ignored(h))
         try:
@@ -673,6 +709,7 @@ class App(tk.Tk):
             h.angebunden_an = var_verbunden.get()
             h.eingerichtet_von = var_eingerichtet.get()
             dlg.destroy()
+            self._rebuild_tree()
 
         btns = tk.Frame(body, bg=CARD)
         btns.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="e", pady=(14, 0))
@@ -714,35 +751,46 @@ class App(tk.Tk):
         try:
             while True:
                 item = self.msg_queue.get_nowait()
-                kind = item[0]
-                if kind == "progress":
-                    _, frac, msg = item
-                    self.progress["value"] = frac
-                    self.var_status.set(msg)
-                    self._last_status = msg
-                elif kind == "host":
-                    h = item[1]
-                    self.hosts.append(h)
-                    self._add_host_row(h)
-                    self._set_counts()
-                elif kind == "done":
-                    self.hosts = item[1] or self.hosts
-                    self._finish_scan()
-                elif kind == "error":
-                    messagebox.showerror("Scan-Fehler", item[1])
-                    self._finish_scan()
-                elif kind == "update":
-                    self._on_update_result(item[1], manual=item[2], error=item[3])
-                elif kind == "install_progress":
-                    _, frac, msg = item
-                    self.btn_update.config(text=msg)
-                elif kind == "install_done":
-                    self._relaunch_after_update(item[1])
-                elif kind == "install_error":
-                    self._install_update_failed(item[1])
+                try:
+                    self._handle_message(item)
+                except Exception as e:  # nie das Polling sterben lassen
+                    print("Fehler bei", item[0], ":", e, file=sys.stderr)
         except queue.Empty:
             pass
-        self.after(120, self._poll_queue)
+        finally:
+            self.after(120, self._poll_queue)
+
+    def _handle_message(self, item):
+        kind = item[0]
+        if kind == "progress":
+            _, frac, msg = item
+            self.progress["value"] = frac
+            self.var_status.set(msg)
+            self._last_status = msg
+        elif kind == "host":
+            h = item[1]
+            self._carry_manual(h)
+            self.hosts.append(h)
+            self._add_host_row(h)
+            self._set_counts()
+        elif kind == "done":
+            self.hosts = item[1] or self.hosts or list(getattr(self, "_manual", {}).values())
+            for h in self.hosts:
+                self._carry_manual(h)
+            self._rebuild_tree()  # Sortierung/Filter wieder deckungsgleich mit self.hosts
+            self._finish_scan()
+        elif kind == "error":
+            messagebox.showerror("Scan-Fehler", item[1])
+            self._finish_scan()
+        elif kind == "update":
+            self._on_update_result(item[1], manual=item[2], error=item[3])
+        elif kind == "install_progress":
+            _, frac, msg = item
+            self.btn_update.config(text=msg)
+        elif kind == "install_done":
+            self._relaunch_after_update(item[1])
+        elif kind == "install_error":
+            self._install_update_failed(item[1])
 
     # ------------------------------------------------------------ Update
     def _check_update_bg(self, manual: bool = False):
@@ -814,7 +862,8 @@ class App(tk.Tk):
             self.msg_queue.put(("install_error", str(e)))
 
     def _relaunch_after_update(self, app_path: str):
-        subprocess.Popen(["open", app_path])
+        # "open" ohne -n würde nur die (gleich endende) laufende Instanz aktivieren
+        subprocess.Popen(["/bin/sh", "-c", 'sleep 1; open -n "$0"', app_path], start_new_session=True)
         self._on_close()
 
     def _install_update_failed(self, error: str):
@@ -832,6 +881,16 @@ class App(tk.Tk):
             self.btn_export.config(state="normal")
         self._set_counts()
         self._update_summary()
+        if self.scanner and self.scanner._cancel.is_set():
+            self._last_status = f"Abgebrochen – {len(self.hosts)} Geräte (unvollständig)."
+            self.var_status.set(self._last_status)
+        elif len(self.hosts) <= 1:
+            messagebox.showinfo(
+                "Kaum Geräte gefunden",
+                "Es wurde (fast) nichts gefunden. Bitte prüfen:\n"
+                "• Stimmt der Netzbereich?\n• Ist der Rechner mit dem Praxisnetz verbunden (nicht Gast-WLAN/VPN)?\n"
+                "• macOS: Systemeinstellungen → Datenschutz & Sicherheit → Lokales Netzwerk → "
+                "Netzwerk-Scanner erlauben.")
 
 
 def main():

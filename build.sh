@@ -173,10 +173,13 @@ pyinstaller --noconfirm NetzwerkScanner.spec
 # nur die äußere Bundle-Signatur konsistent gemacht. Auf Apple Silicon MUSS
 # die Signatur gültig sein, sonst laden Bausteine wie _struct nicht.
 echo "    App ad-hoc signieren …"
+# Ohne gültige Signatur crasht die App auf Apple Silicon (Punkt 3) und das Auto-Update lehnt sie ab
+# -> lieber hier abbrechen als ein kaputtes Release ausliefern.
 codesign --force --sign - "dist/$APP_NAME.app" \
-  && echo "    Signatur ok." \
-  || echo "    WARNUNG: Signieren fehlgeschlagen (PyInstaller-Signatur bleibt)."
-codesign --verify --verbose=1 "dist/$APP_NAME.app" 2>&1 | sed 's/^/    /' || true
+  || { echo "    FEHLER: Signieren fehlgeschlagen." >&2; exit 1; }
+codesign --verify --verbose=1 "dist/$APP_NAME.app" \
+  || { echo "    FEHLER: Signatur ungültig." >&2; exit 1; }
+echo "    Signatur ok."
 
 echo "==> 5/6  .dmg erstellen"
 rm -f "$DMG_NAME"

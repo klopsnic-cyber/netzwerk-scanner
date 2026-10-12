@@ -8,6 +8,7 @@ abgeleitet. Alles nur als *Hinweis*; unsichere Felder bleiben leer.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -18,6 +19,11 @@ def _has(h: "Host", *ports: int) -> bool:
     return any(p in h.open_ports for p in ports)
 
 
+def _word(name: str, *words: str) -> bool:
+    """Kürzel als eigenes Namensteil ("nas01", "srv-dc"), nicht als Teilwort ("Jonas-MBP")."""
+    return any(re.search(rf"(^|[-_.\s]){w}\d*($|[-_.\s])", name) for w in words)
+
+
 def classify_device(h: "Host") -> None:
     name = (h.hostname or "").lower()
     vendor = (h.vendor or "").lower()
@@ -25,23 +31,29 @@ def classify_device(h: "Host") -> None:
 
     # --- Betriebssystem-Hinweis ---------------------------------------
     if not h.os_hint:
-        if _has(h, 135, 139, 445, 3389, 5985):
+        # Mac-Name/Hersteller zuerst: Macs haben oft SMB (445) offen und sind trotzdem keine Windows-PCs
+        if "macbook" in name or "imac" in name or _word(name, "mac", "mbp") or "apple" in vendor:
+            h.os_hint = "macOS"
+        elif _has(h, 135, 139, 445, 3389, 5985):
             h.os_hint = "Windows"
-        elif _has(h, 548) or "apple" in vendor or "mac" in name:
+        elif _has(h, 548):
             h.os_hint = "macOS"
         elif _has(h, 22) and not _has(h, 445):
             h.os_hint = "Linux/Unix"
 
     # --- Gerätetyp -----------------------------------------------------
     device = ""
+    # iPhone/iPad vor allem anderen ("phone" im Namen ist kein VoIP-Telefon)
+    if "iphone" in name or "ipad" in name or _has(h, 62078):
+        device = "iPhone / iPad"
     # Drucker
-    if _has(h, 9100, 515, 631) or any(k in vendor for k in ("brother", "kyocera", "ricoh", "xerox", "canon", "epson", "lexmark")) or "print" in name:
+    elif _has(h, 9100, 515, 631) or any(k in vendor for k in ("brother", "kyocera", "ricoh", "xerox", "canon", "epson", "lexmark")) or "print" in name:
         device = "Drucker"
     # NAS
-    elif any(k in vendor for k in ("synology", "qnap")) or "nas" in name or _has(h, 2049):
+    elif any(k in vendor for k in ("synology", "qnap")) or _word(name, "nas") or _has(h, 2049):
         device = "NAS / Fileserver"
     # Router / Gateway
-    elif any(k in vendor for k in ("avm", "fritz", "netgear", "tp-link", "cisco", "ubiquiti", "draytek")) or "router" in name or "gateway" in name or h.ip.endswith(".1") or h.ip.endswith(".254"):
+    elif any(k in vendor for k in ("avm", "fritz", "netgear", "tp-link", "cisco", "ubiquiti", "draytek")) or "router" in name or "gateway" in name:
         device = "Router / Gateway"
     # VoIP
     elif any(k in vendor for k in ("grandstream", "snom", "yealink", "gigaset")) or "voip" in name or "phone" in name:
@@ -50,16 +62,19 @@ def classify_device(h: "Host") -> None:
     elif any(k in name for k in ("kartenleser", "egk", "konnektor", "cherry", "orga")):
         device = "Kartenleser / TI-Komponente"
     # Server
-    elif _has(h, 1433, 3306, 5432, 1521) or "sql" in name or "server" in name or "srv" in name or "dc" in name:
+    elif _has(h, 1433, 3306, 5432, 1521) or "sql" in name or "server" in name or _word(name, "srv", "dc"):
         device = "Server"
     # Virtuelle Maschine
-    elif any(k in vendor for k in ("vmware", "virtualbox", "qemu", "kvm")):
+    elif any(k in vendor for k in ("vmware", "virtualbox", "qemu", "kvm")) or (h.mac or "").upper().startswith("00:15:5D"):
         device = "Virtuelle Maschine"
     # Client-PC
     elif h.os_hint == "Windows":
         device = "PC / Workstation (Windows)"
     elif h.os_hint == "macOS":
         device = "Mac"
+    # .1/.254 nur als letzter Hinweis: ein Windows-Server oder Mac auf .1 bleibt, was er ist
+    elif h.ip.endswith(".1") or h.ip.endswith(".254"):
+        device = "Router / Gateway"
     elif _has(h, 80, 443) and not device:
         device = "Netzwerkgerät (Web-Oberfläche)"
     h.device_type = device

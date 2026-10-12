@@ -18,6 +18,7 @@ from __future__ import annotations
 import concurrent.futures
 import errno
 import ipaddress
+import itertools
 import os
 import platform
 import re
@@ -31,6 +32,20 @@ from typing import Callable, Dict, List, Optional
 
 from .oui import lookup_vendor
 from .classify import classify_device
+
+# Windows: ping/arp ohne aufblitzendes Konsolenfenster starten (GUI-Build hat keine Konsole).
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+
+# macOS-GUI-Apps starten mit nur 256 Dateihandles; 128 parallele Pings/Sockets reißen das,
+# und die betroffenen Hosts fielen still aus dem Ergebnis. Soft-Limit anheben (best effort).
+try:
+    import resource
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    _want = 4096 if _hard == resource.RLIM_INFINITY else min(4096, _hard)
+    if _soft < _want:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_want, _hard))
+except (ImportError, ValueError, OSError):
+    pass
 
 # ---------------------------------------------------------------------------
 # Datenmodell
@@ -150,8 +165,7 @@ def guess_local_network(prefix: int = 24) -> str:
 
 def hosts_in_network(cidr: str, limit: int = 1024) -> List[str]:
     net = ipaddress.ip_network(cidr, strict=False)
-    hosts = [str(h) for h in net.hosts()]
-    return hosts[:limit]
+    return [str(h) for h in itertools.islice(net.hosts(), limit)]
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +187,12 @@ def ping(ip: str, timeout: float = 1.0) -> bool:
     try:
         res = subprocess.run(
             _ping_cmd(ip, timeout),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=timeout + 1.5,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=timeout + 1.5, **NO_WINDOW,
         )
-        return res.returncode == 0
+        # Windows-ping meldet Exit 0 auch bei "Zielhost nicht erreichbar" (Antwort vom Router);
+        # nur eine echte Antwort enthält "TTL=" (sprachunabhängig).
+        return res.returncode == 0 and (os.name != "nt" or b"TTL=" in res.stdout.upper())
     except Exception:
         return False
 
@@ -252,13 +268,13 @@ def read_arp_table() -> Dict[str, str]:
     system = platform.system().lower()
     try:
         if system == "windows":
-            out = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10, **NO_WINDOW).stdout
             for line in out.splitlines():
                 m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})", line)
                 if m:
                     table[m.group(1)] = normalize_mac(m.group(2).replace("-", ":"))
         else:
-            out = subprocess.run([_arp_binary(), "-a"], capture_output=True, text=True, timeout=10).stdout
+            out = subprocess.run([_arp_binary(), "-a"], capture_output=True, text=True, timeout=10, **NO_WINDOW).stdout
             for line in out.splitlines():
                 ipm = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)", line)
                 macm = _MAC_RE.search(line)
@@ -402,13 +418,17 @@ def netbios_name(ip: str, timeout: float = 1.0) -> str:
         sock.sendto(query, (ip, 137))
         try:
             data, _ = sock.recvfrom(1024)
-        except socket.timeout:
-            return ""  # keine Antwort - normal, kein Fehler
+        except (socket.timeout, ConnectionResetError):
+            return ""  # keine Antwort (Windows: ICMP port unreachable) - normal, kein Fehler
+        if len(data) < 57:
+            return ""
         num_names = data[56]
         offset = 57
         for _ in range(num_names):
+            if offset + 18 > len(data):
+                break
             name = data[offset:offset + 15].decode("ascii", "ignore").strip()
-            flags = data[offset + 15]
+            flags = data[offset + 16]  # Byte 15 ist das Suffix, 16/17 die Flags
             offset += 18
             # Unique + kein Gruppenname -> Rechnername
             if flags & 0x80 == 0 and name and name != "__MSBROWSE__":
@@ -505,6 +525,7 @@ class Scanner:
             futures = {ex.submit(probe, ip, cfg.ping_timeout): ip for ip in targets}
             for fut in concurrent.futures.as_completed(futures):
                 if self._cancel.is_set():
+                    ex.shutdown(wait=False, cancel_futures=True)
                     break
                 ip = futures[fut]
                 done += 1
@@ -538,6 +559,8 @@ class Scanner:
 
         def enrich(ip: str) -> Host:
             h = Host(ip=ip)
+            if self._cancel.is_set():
+                return h
             h.mac = arp.get(ip, "")
             if h.mac:
                 h.vendor = lookup_vendor(h.mac)
@@ -575,6 +598,7 @@ class Scanner:
             futures = {ex.submit(enrich, ip): ip for ip in alive}
             for fut in concurrent.futures.as_completed(futures):
                 if self._cancel.is_set():
+                    ex.shutdown(wait=False, cancel_futures=True)
                     break
                 done += 1
                 try:
@@ -590,5 +614,8 @@ class Scanner:
                              f"Details {done}/{n_alive} – {h.ip}")
 
         hosts.sort(key=lambda x: x.sort_key())
-        self._report(progress, 1.0, f"Fertig – {len(hosts)} Geräte.")
+        if self._cancel.is_set():
+            self._report(progress, 1.0, f"Abgebrochen – {len(hosts)} Geräte (unvollständig).")
+        else:
+            self._report(progress, 1.0, f"Fertig – {len(hosts)} Geräte.")
         return hosts

@@ -96,7 +96,11 @@ NetzwerkScanner.spec       PyInstaller-Konfiguration
     z.B. bei Nicht-Admin-Konten, kaputte .dmg) bricht VOR bzw. mit Rollback
     NACH dem Austausch ab und bietet den manuellen Download über die
     Release-Seite als Rückfall an – die App bleibt in jedem Fehlerfall
-    lauffähig. Release veröffentlichen: Version in `__init__.py` erhöhen,
+    lauffähig. Seit 1.3.0 vor dem Austausch geprüft: vollständiger Download,
+    SHA256 gegen den `digest` des Release-Anhangs (GitHub-API), nur Links ins
+    eigene Repo, `codesign --verify` und Version in der Info.plist der neuen
+    App. Läuft die App aus der DMG/AppTranslocation, kommt ein Hinweis statt
+    eines Versuchs. Neustart per `open -n` nach Prozessende. Release veröffentlichen: Version in `__init__.py` erhöhen,
     `./build.sh`, dann `gh release create vX.Y.Z Netzwerk-Scanner.dmg`.
 
 11. **python.org-Python hat KEIN eigenes Root-Zertifikatsbündel** (anders als

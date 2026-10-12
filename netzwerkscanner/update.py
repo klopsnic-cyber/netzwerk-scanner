@@ -11,7 +11,10 @@ als Rückfall den manuellen Download über die Release-Seite an.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import plistlib
+import re
 import os
 import shutil
 import ssl
@@ -48,17 +51,13 @@ class UpdateInfo(TypedDict):
     url: str
     notes: str
     asset_url: str  # Download-Link der .dmg, "" wenn keine im Release
+    digest: str     # "sha256:…" der .dmg laut GitHub, "" wenn unbekannt
 
 
 def _parse_version(tag: str) -> tuple:
-    parts = tag.lstrip("vV").split(".")
-    result = []
-    for p in parts:
-        try:
-            result.append(int(p))
-        except ValueError:
-            break
-    return tuple(result)
+    """'v1.2' == '1.2.0'; Suffixe wie '-beta' werden ignoriert."""
+    n = [int(x) for x in re.findall(r"\d+", tag.split("-")[0])][:3]
+    return tuple(n + [0] * (3 - len(n)))
 
 
 def _fetch_latest_release(timeout: float) -> Optional[UpdateInfo]:
@@ -76,14 +75,21 @@ def _fetch_latest_release(timeout: float) -> Optional[UpdateInfo]:
     if _parse_version(tag) <= _parse_version(__version__):
         return None
 
-    asset_url = ""
+    asset_url = digest = ""
     for asset in data.get("assets", []):
         if asset.get("name", "").endswith(".dmg"):
             asset_url = asset.get("browser_download_url", "")
+            digest = asset.get("digest") or ""
             break
+    # Nur Links ins eigene Repo zulassen (Download und Release-Seite)
+    if not asset_url.startswith(f"https://github.com/{REPO}/releases/download/"):
+        asset_url = ""
+    url = data.get("html_url", "")
+    if not url.startswith(f"https://github.com/{REPO}/"):
+        url = f"https://github.com/{REPO}/releases/latest"
 
-    return UpdateInfo(version=tag.lstrip("vV"), url=data.get("html_url", ""),
-                       notes=(data.get("body") or "").strip(), asset_url=asset_url)
+    return UpdateInfo(version=tag.lstrip("vV"), url=url,
+                       notes=(data.get("body") or "").strip(), asset_url=asset_url, digest=digest)
 
 
 def check_for_update(timeout: float = 5.0) -> Optional[UpdateInfo]:
@@ -110,7 +116,7 @@ def current_app_bundle() -> str:
     if not getattr(sys, "frozen", False):
         return ""
     marker = ".app/Contents/MacOS/"
-    idx = sys.executable.find(marker)
+    idx = sys.executable.rfind(marker)
     if idx == -1:
         return ""
     return sys.executable[:idx + 4]  # bis inkl. ".app"
@@ -126,6 +132,9 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
     target = current_app_bundle()
     if not target:
         raise RuntimeError("Kein installiertes .app-Bundle gefunden (Dev-Modus?)")
+    if "/AppTranslocation/" in target or target.startswith("/Volumes/"):
+        raise RuntimeError("Die App läuft direkt aus dem Download bzw. der DMG. Bitte zuerst in den "
+                           "Ordner „Programme“ ziehen und von dort starten, dann klappt das Update.")
     if not info["asset_url"]:
         raise RuntimeError("Kein .dmg-Anhang im Release gefunden")
     if not os.access(os.path.dirname(target), os.W_OK):
@@ -137,7 +146,9 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
 
     # --- Herunterladen ------------------------------------------------
     report(0.0, "Lade Update herunter …")
-    tmp_dmg = os.path.join(tempfile.gettempdir(), "netzwerk-scanner-update.dmg")
+    tmp_dir = tempfile.mkdtemp(prefix="netzwerk-scanner-update-")
+    tmp_dmg = os.path.join(tmp_dir, "update.dmg")
+    sha = hashlib.sha256()
     req = urllib.request.Request(
         info["asset_url"],
         headers={"User-Agent": f"Netzwerk-Scanner/{__version__}",
@@ -151,6 +162,7 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
             if not chunk:
                 break
             f.write(chunk)
+            sha.update(chunk)
             done += len(chunk)
             if total:
                 frac = done / total
@@ -158,7 +170,14 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
                     report(0.7 * frac, f"Lade Update herunter … {done // 1024}/{total // 1024} KB")
                     last_reported = frac
 
+    staging = target + ".update"
     try:
+        # --- Vollständigkeit und Prüfsumme (GitHub liefert sha256 je Anhang) ---
+        if total and done != total:
+            raise RuntimeError(f"Download unvollständig ({done} von {total} Bytes)")
+        if info.get("digest") and info["digest"] != "sha256:" + sha.hexdigest():
+            raise RuntimeError("Prüfsumme der Update-Datei stimmt nicht – Update abgebrochen")
+
         # --- .dmg mounten, .app finden ---------------------------------
         report(0.7, "Bereite Installation vor …")
         mount_point = tempfile.mkdtemp(prefix="netzwerk-scanner-mount-")
@@ -173,15 +192,31 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
 
                 # --- Kopieren in ein Staging-Verzeichnis neben dem Ziel -
                 report(0.8, "Installiere …")
-                staging = target + ".update"
                 if os.path.exists(staging):
                     shutil.rmtree(staging)
                 subprocess.run(["ditto", source_app, staging], check=True, timeout=120)
             finally:
-                subprocess.run(["hdiutil", "detach", mount_point, "-quiet"],
-                               timeout=30, check=False)
+                try:
+                    r = subprocess.run(["hdiutil", "detach", mount_point, "-quiet"], timeout=30, check=False)
+                    ok = r.returncode == 0
+                except subprocess.TimeoutExpired:
+                    ok = False
+                if not ok:
+                    subprocess.run(["hdiutil", "detach", mount_point, "-force", "-quiet"],
+                                   timeout=30, check=False)
         finally:
-            shutil.rmtree(mount_point, ignore_errors=True)
+            try:
+                os.rmdir(mount_point)  # rmdir statt rmtree: fasst ein noch gemountetes Volume nie an
+            except OSError:
+                pass
+
+        # --- Neue App prüfen, bevor die alte angefasst wird --------------
+        subprocess.run(["codesign", "--verify", staging], check=True, timeout=60,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(staging, "Contents", "Info.plist"), "rb") as pf:
+            neu = plistlib.load(pf).get("CFBundleShortVersionString", "")
+        if _parse_version(neu) != _parse_version(info["version"]):
+            raise RuntimeError(f"Die geladene App hat Version {neu or '?'} statt {info['version']}")
 
         # --- Sicherer Austausch: alt beiseite, neu rein, bei Fehler zurück
         report(0.95, "Ersetze Anwendung …")
@@ -196,10 +231,8 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
             raise
         shutil.rmtree(backup, ignore_errors=True)
     finally:
-        try:
-            os.remove(tmp_dmg)
-        except OSError:
-            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)  # nur noch da, wenn etwas schiefging
 
     report(1.0, "Fertig.")
     return target

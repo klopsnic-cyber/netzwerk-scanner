@@ -57,7 +57,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          TAG="${{ github.ref_name }}"
-          if [ -n "${{ inputs.tag }}" ]; then TAG="${{ inputs.tag }}"; fi
+          TAG="$REF_NAME"
+          if [ -n "$INPUT_TAG" ]; then TAG="$INPUT_TAG"; fi
           gh release upload "$TAG" Netzwerk-Scanner-Windows.zip --clobber --repo "$GITHUB_REPOSITORY"
