@@ -1,10 +1,10 @@
 """
 Hersteller-Erkennung über die MAC-Adresse (OUI = erste 3 Bytes).
 
-Die vollständige IEEE-OUI-Datenbank wird beim Build (build.sh) als
-'data/oui.csv' heruntergeladen und mitgebündelt -> Lookup funktioniert
-danach komplett offline. Fehlt die Datei, greift eine eingebaute
-Liste der häufigsten Hersteller.
+Die IEEE-Listen (MA-L 6, MA-M 7, MA-S 9 Hexstellen) werden beim Build per
+assets/make_oui_data.py in oui_data.py eingebettet -> Lookup komplett offline.
+Eine optionale data/oui.csv neben der App überschreibt (nur MA-L). Fehlt die
+eingebettete Liste, greift eine kleine Liste häufiger Hersteller.
 """
 
 from __future__ import annotations
@@ -58,15 +58,14 @@ _FALLBACK = {
     "F0A225": "Samsung", "8425DB": "Samsung",
     "001D0F": "TP-Link", "50C7BF": "TP-Link", "A42BB0": "TP-Link",
     "C46E1F": "TP-Link", "EC086B": "TP-Link",
-    "001217": "Cisco-Linksys", "0021291": "Cisco",
+    "001217": "Cisco-Linksys", "002129": "Cisco",
     "0018E7": "Cameo (Netgear)", "000FB5": "Netgear",
     "008EF2": "Netgear", "204E7F": "Netgear", "A040A0": "Netgear",
     "001DD8": "Microsoft", "0017FA": "Microsoft", "7C1E52": "Microsoft",
     "000D3A": "Microsoft", "485073": "Microsoft",
-    "001132": "Synology", "0011322": "Synology", "0024219": "QNAP",
+    "001132": "Synology",
     "24513F": "QNAP", "245EBE": "QNAP",
     "B8AC6F": "Dell", "F04DA2": "Dell",
-    "0025645": "Dell",
 }
 
 
@@ -92,8 +91,8 @@ def _load() -> Dict[str, str]:
     try:
         from . import oui_data
         table.update(oui_data.load())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Hinweis: eingebettete Hersteller-Liste unbrauchbar ({e})", file=sys.stderr)
 
     # 2) Optionale externe data/oui.csv (z.B. aktuellere Liste) überschreibt.
     path = _oui_path()
@@ -117,8 +116,8 @@ def _load() -> Dict[str, str]:
                         continue
                     prefix = row[assign_idx].strip().upper().replace("-", "").replace(":", "")
                     name = row[name_idx].strip()
-                    if len(prefix) >= 6 and name:
-                        table[prefix[:6]] = name
+                    if len(prefix) == 6 and name:
+                        table[prefix] = name
         except Exception:
             pass
     _CACHE = table
@@ -126,14 +125,15 @@ def _load() -> Dict[str, str]:
 
 
 def lookup_vendor(mac: str) -> str:
-    """Gibt den Herstellernamen zur MAC-Adresse zurück ('' wenn unbekannt)."""
-    if not mac:
-        return ""
-    clean = mac.upper().replace(":", "").replace("-", "").replace(".", "")
-    if len(clean) < 6:
-        return ""
-    prefix = clean[:6]
-    return _load().get(prefix, "")
+    """Herstellername zur MAC ('' wenn unbekannt). Längster Präfix gewinnt (MA-S 9, MA-M 7, MA-L 6)."""
+    clean = (mac or "").upper().replace(":", "").replace("-", "").replace(".", "")
+    t = _load()
+    for n in (9, 7, 6):
+        if len(clean) >= n and clean[:n] in t:
+            name = t[clean[:n]]
+            # MA-M/MA-S-Block ohne Unterblock-Eintrag: nur "IEEE Registration Authority" -> irreführend
+            return "" if name == "IEEE Registration Authority" else name
+    return ""
 
 
 def database_size() -> int:

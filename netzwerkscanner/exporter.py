@@ -12,8 +12,6 @@ import base64
 import datetime as _dt
 import io
 import os
-import sys
-from copy import copy
 from typing import List, Optional
 
 import msoffcrypto
@@ -63,14 +61,14 @@ def default_template_path() -> str:
 
 def _text(v):
     """Werte aus dem Netz/der Eingabe sicher als Text: Steuerzeichen raus (sonst bricht der
-    ganze Export ab), und "=..." bleibt Text statt Excel-Formel."""
-    return ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v
+    ganze Export ab), auf Excels Zellgrenze (32767) gekürzt."""
+    return ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v
 
 
 def _set(ws, row, col, value):
     cell = ws.cell(row=row, column=col, value=_text(value))
     if isinstance(cell.value, str):
-        cell.data_type = "s"
+        cell.data_type = "s"  # "=..." bleibt Text statt Excel-Formel
     return cell
 
 
@@ -119,6 +117,8 @@ def export(hosts: List[Host], out_path: str,
         start, end = tbl.ref.split(":")
         if start.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ") == str(HEADER_ROW):  # nur die Gerätetabelle
             tbl.ref = f"{start}:{end.rstrip('0123456789')}{max(row - 1, FIRST_DATA_ROW)}"
+            if tbl.autoFilter is not None:
+                tbl.autoFilter.ref = tbl.ref
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 

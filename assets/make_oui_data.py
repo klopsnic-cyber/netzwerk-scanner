@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """
-Erzeugt netzwerkscanner/oui_data.py aus data/oui.csv.
+Erzeugt netzwerkscanner/oui_data.py aus den IEEE-Listen (MA-L, MA-M, MA-S).
 
 Die offizielle IEEE-OUI-Liste wird kompakt (Prefix -> Hersteller), gzip-komprimiert
 und base64-kodiert fest in den Programmcode eingebettet. Dadurch funktioniert die
 Hersteller-Erkennung immer offline und überlebt jede Art der Weitergabe (DMG, etc.),
 ohne von einer separaten Datei abzuhängen.
 
-Aufruf:  python3 assets/make_oui_data.py
+Aufruf:  python3 assets/make_oui_data.py [oui.csv mam.csv oui36.csv]
+(Standard: data/oui.csv data/mam.csv data/oui36.csv; fehlende werden übersprungen)
 """
 from __future__ import annotations
 
 import base64
 import csv
 import gzip
-import io
 import os
 import sys
 import textwrap
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CSV = os.path.join(ROOT, "data", "oui.csv")
+DEFAULTS = [os.path.join(ROOT, "data", n) for n in ("oui.csv", "mam.csv", "oui36.csv")]
 OUT = os.path.join(ROOT, "netzwerkscanner", "oui_data.py")
+MIN_MAL = 30000  # Plausibilität: so viele MA-L-Einträge (6 Hexstellen) muss die Liste haben
 
 
 def build_mapping(path):
+    """{Präfix in voller Länge (6/7/9 Hexstellen): Name} aus einer IEEE-CSV."""
     table = {}
     with open(path, "r", encoding="utf-8", errors="ignore", newline="") as f:
         reader = csv.reader(f)
@@ -42,16 +44,23 @@ def build_mapping(path):
                 continue
             prefix = row[assign_idx].strip().upper().replace("-", "").replace(":", "")
             name = row[name_idx].strip()
-            if len(prefix) >= 6 and name:
-                table[prefix[:6]] = name
+            if len(prefix) in (6, 7, 9) and name:
+                table[prefix] = name
     return table
 
 
 def main():
-    if not os.path.exists(CSV):
-        print(f"HINWEIS: {CSV} fehlt – oui_data.py wird nicht neu erzeugt.")
-        return
-    table = build_mapping(CSV)
+    paths = sys.argv[1:] or DEFAULTS
+    table = {}
+    for p in paths:
+        if not os.path.exists(p):
+            print(f"HINWEIS: {p} fehlt - übersprungen.")
+            continue
+        table.update(build_mapping(p))
+    mal = sum(1 for k in table if len(k) == 6)
+    if mal < MIN_MAL:
+        print(f"FEHLER: nur {mal} MA-L-Einträge (min. {MIN_MAL}) - oui_data.py bleibt unverändert.")
+        sys.exit(1)
     # Kompakt serialisieren: "PREFIX\tName\n"
     lines = "".join(f"{p}\t{n}\n" for p, n in sorted(table.items()))
     packed = gzip.compress(lines.encode("utf-8"), 9)
@@ -59,7 +68,7 @@ def main():
     chunks = textwrap.wrap(b64, 76)
     with open(OUT, "w", encoding="utf-8") as f:
         f.write('"""Eingebettete IEEE-OUI-Herstellerliste (Prefix -> Hersteller).\n')
-        f.write("Automatisch aus data/oui.csv erzeugt – nicht von Hand bearbeiten.\n")
+        f.write("Automatisch aus den IEEE-CSVs erzeugt – nicht von Hand bearbeiten.\n")
         f.write(f"Einträge: {len(table)}\n\"\"\"\n\n")
         f.write("import base64 as _b64, gzip as _gz\n\n")
         f.write(f"COUNT = {len(table)}\n\n")

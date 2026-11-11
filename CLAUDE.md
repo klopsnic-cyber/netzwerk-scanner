@@ -152,16 +152,39 @@ NetzwerkScanner.spec       PyInstaller-Konfiguration
     Geräte aus dem eigenen Subnetz werden per UDP-Paket neu „angestoßen“ und die
     Tabelle bis zu 3× gelesen (`read_arp_for`); die eigene MAC kommt aus
     `ifconfig` bzw. PowerShell `Get-NetAdapter` (`own_mac`). Selbsttest:
-    `tests/selbsttest_mac.py`, läuft auch im Windows-Build auf GitHub mit echter
+    `tests/selbsttest.py`, läuft auch im Windows-Build auf GitHub mit echter
     ARP-Abfrage.
 
 15. **Reverse-DNS nur per `getnameinfo` mit 3-s-Limit, nie `gethostbyaddr`.**
     `gethostbyaddr` läuft auf macOS hinter einer globalen Sperre (seriell) und
     wartet ohne PTR ~30 s pro Gerät → Scan mit 22 Geräten über 13 Minuten.
     Mit `getnameinfo` in einem Hilfsthread: gleiches Netz in 37 s.
+16. **Erreichbarkeit: alle Ports parallel, 1,5 s Gesamt-Timeout (`tcp_reachable`).**
+    Schlafende iPhones antworten erst nach 1–1,5 s; mit 0,6 s fehlen sie.
+    `selectors` statt `select()` (select stürzt bei Dateinummern > 1024 ab).
+    Fehler (EMFILE, ping fehlt, arp hängt) nie still schlucken → `Scanner.last_problems`,
+    die GUI zeigt sie an. Eigene IP per `local_ip_for(ziel)` (richtige Karte bei VPN),
+    nie 127.0.0.1 als Netz vorschlagen (`guess_local_network()` → "").
+    Netze > /22 oder IPv6: `hosts_in_network` wirft ValueError mit deutscher Meldung.
+17. **Hersteller: MA-L + MA-M + MA-S.** `oui.lookup_vendor` sucht 9 → 7 → 6 Hexstellen;
+    „IEEE Registration Authority" wird nie angezeigt. Die IEEE-Seite lehnt automatische
+    Downloads teils ab – `build.sh` behält dann die vorhandenen `data/*.csv` (keine
+    Browser-Tarnung einbauen).
+18. **Gerätetyp vorsichtig.** NetBIOS ≠ Windows (Samba auf NAS/Mac). 631/515 allein ist kein
+    Drucker, wenn 445/548 offen. Druckerhersteller (HP!) nur ohne PC/Server-Merkmale.
+    Namensregeln per Wortgrenze (`_word`). 62078 → iPhone/iPad.
+19. **Handeingaben (GUI) bleiben über Scans erhalten**, Schlüssel MAC, sonst IP – bei
+    „MAC mehrfach vergeben" (Repeater) nur IP. Nicht erreichbare Geräte mit Handeingaben
+    stehen mit Hinweis in der Tabelle, kommen aber NICHT in den Excel-Export (Entscheidung 7).
+    Sitzung wird nach Scan/Bearbeitung atomar gespeichert (0600).
+20. **Release-Sicherheit.** Auto-Update installiert nur mit SHA256-Digest des Assets
+    (fail-closed). Workflow: Build-Job nur `contents: read`, Upload-Job ohne Code-Checkout;
+    Actions auf Commit-SHA gepinnt; Pakete in `requirements*.txt` exakt gepinnt.
+    `tests/selbsttest.py` läuft in build.sh und im Workflow – rot = kein Build.
+    `--cli` im Windows-GUI-Build (keine Konsole) endet mit Exit 2.
 
 ## Eingebettete Daten neu erzeugen
-- OUI: `python3 assets/make_oui_data.py` (nach Aktualisieren von `data/oui.csv`)
+- OUI: `python3 assets/make_oui_data.py data/oui.csv data/mam.csv data/oui36.csv`
 - Vorlage: aus data/Netzwerkdoku-Vorlage.xlsx per base64 nach template_data.py
 - Icon: `python3 assets/make_icon.py assets/` + `iconutil -c icns …`
 

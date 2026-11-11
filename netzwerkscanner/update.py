@@ -54,10 +54,20 @@ class UpdateInfo(TypedDict):
     digest: str     # "sha256:…" der .dmg laut GitHub, "" wenn unbekannt
 
 
-def _parse_version(tag: str) -> tuple:
-    """'v1.2' == '1.2.0'; Suffixe wie '-beta' werden ignoriert."""
-    n = [int(x) for x in re.findall(r"\d+", tag.split("-")[0])][:3]
-    return tuple(n + [0] * (3 - len(n)))
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?(.*)$")
+_PRERELEASE_RE = re.compile(r"(?i)alpha|beta|pre|rc|dev|^[.-]?[ab]\d")
+
+
+def _parse_version(tag: str, allow_pre: bool = False) -> Optional[tuple]:
+    """'v1.2.3', '1.2.3', 'release-1.2.3' -> (1, 2, 3); 'v1.2' -> (1, 2, 0).
+    None, wenn keine Version erkennbar ist oder (ohne allow_pre) eine
+    Vorabversion wie '-rc1'/'-beta' vorliegt - die wird nie als Update angeboten."""
+    m = _VERSION_RE.search(tag.strip())
+    if not m:
+        return None
+    if not allow_pre and _PRERELEASE_RE.search(m.group(4)):
+        return None
+    return tuple(int(x or 0) for x in m.groups()[:3])
 
 
 def _fetch_latest_release(timeout: float) -> Optional[UpdateInfo]:
@@ -72,7 +82,9 @@ def _fetch_latest_release(timeout: float) -> Optional[UpdateInfo]:
         data = json.load(resp)
 
     tag = data.get("tag_name", "")
-    if _parse_version(tag) <= _parse_version(__version__):
+    neu = _parse_version(tag)
+    if data.get("prerelease") or data.get("draft") or neu is None \
+            or neu <= (_parse_version(__version__, allow_pre=True) or (0, 0, 0)):
         return None
 
     asset_url = digest = ""
@@ -88,7 +100,7 @@ def _fetch_latest_release(timeout: float) -> Optional[UpdateInfo]:
     if not url.startswith(f"https://github.com/{REPO}/"):
         url = f"https://github.com/{REPO}/releases/latest"
 
-    return UpdateInfo(version=tag.lstrip("vV"), url=url,
+    return UpdateInfo(version=".".join(map(str, neu)), url=url,
                        notes=(data.get("body") or "").strip(), asset_url=asset_url, digest=digest)
 
 
@@ -137,6 +149,11 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
                            "Ordner „Programme“ ziehen und von dort starten, dann klappt das Update.")
     if not info["asset_url"]:
         raise RuntimeError("Kein .dmg-Anhang im Release gefunden")
+    # Fail-closed: ohne Prüfsumme von GitHub keine automatische Installation
+    digest = (info.get("digest") or "").lower()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise RuntimeError("Für dieses Release liefert GitHub keine SHA256-Prüfsumme – "
+                           "automatische Installation aus Sicherheitsgründen abgelehnt.")
     if not os.access(os.path.dirname(target), os.W_OK):
         raise PermissionError(f"Keine Schreibrechte für {os.path.dirname(target)}")
 
@@ -175,7 +192,8 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
         # --- Vollständigkeit und Prüfsumme (GitHub liefert sha256 je Anhang) ---
         if total and done != total:
             raise RuntimeError(f"Download unvollständig ({done} von {total} Bytes)")
-        if info.get("digest") and info["digest"] != "sha256:" + sha.hexdigest():
+        # Fehlt Content-Length, reicht die SHA256-Prüfung (digest ist oben Pflicht)
+        if digest != "sha256:" + sha.hexdigest():
             raise RuntimeError("Prüfsumme der Update-Datei stimmt nicht – Update abgebrochen")
 
         # --- .dmg mounten, .app finden ---------------------------------
@@ -215,7 +233,8 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(os.path.join(staging, "Contents", "Info.plist"), "rb") as pf:
             neu = plistlib.load(pf).get("CFBundleShortVersionString", "")
-        if _parse_version(neu) != _parse_version(info["version"]):
+        neu_v = _parse_version(neu, allow_pre=True)
+        if neu_v is None or neu_v != _parse_version(info["version"], allow_pre=True):
             raise RuntimeError(f"Die geladene App hat Version {neu or '?'} statt {info['version']}")
 
         # --- Sicherer Austausch: alt beiseite, neu rein, bei Fehler zurück
@@ -226,10 +245,21 @@ def install_update(info: UpdateInfo, progress: ProgressCb = None) -> str:
         os.rename(target, backup)
         try:
             os.rename(staging, target)
-        except Exception:
-            os.rename(backup, target)  # Rollback: alte Version bleibt lauffähig
+        except Exception as e:
+            try:
+                os.rename(backup, target)  # Rollback: alte Version bleibt lauffähig
+            except Exception as e2:
+                raise RuntimeError(
+                    f"Austausch fehlgeschlagen ({e}) UND Wiederherstellen der alten Version "
+                    f"fehlgeschlagen ({e2}). Die bisherige App liegt unter:\n{backup}\n"
+                    f"Bitte im Finder zurück in „{os.path.basename(target)}“ umbenennen.") from e
             raise
-        shutil.rmtree(backup, ignore_errors=True)
+        try:
+            shutil.rmtree(backup)
+        except OSError as e:  # nicht fatal: neue Version ist schon an Ort und Stelle
+            hinweis = f"Alte Version konnte nicht gelöscht werden ({e}): {backup}"
+            print(hinweis, file=sys.stderr)
+            report(0.99, hinweis)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         shutil.rmtree(staging, ignore_errors=True)  # nur noch da, wenn etwas schiefging

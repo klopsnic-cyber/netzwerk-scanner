@@ -85,8 +85,9 @@ if [ ! -d "$VENV" ]; then
 fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
-pip install --upgrade pip >/dev/null
-pip install -r requirements.txt
+# Alles exakt gepinnt (requirements*.txt) -> reproduzierbare Builds.
+pip install pip==26.3 >/dev/null
+pip install -r requirements.txt -r requirements-build.txt
 
 # 'cryptography' (für die Excel-Verschlüsselung) hat eine kompilierte
 # Rust-Erweiterung - "pip install" liefert normal nur die Architektur DIESES
@@ -97,14 +98,16 @@ pip install -r requirements.txt
 if [ "$PORTABLE" = "1" ]; then
   echo "    Erzwinge universal2-Wheel für 'cryptography' (Intel + Apple Silicon)…"
   PYVER=$("$PYBIN" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')
+  CRYPTO_VER=$(python -c "import importlib.metadata as m; print(m.version('cryptography'))")
   TMPWHL=$(mktemp -d)
-  if pip download cryptography --no-deps --only-binary=:all: \
+  if pip download "cryptography==$CRYPTO_VER" --no-deps --only-binary=:all: \
       --platform macosx_11_0_universal2 --python-version "$PYVER" --implementation cp \
       -d "$TMPWHL" >/dev/null 2>&1; then
     pip install --force-reinstall --no-deps "$TMPWHL"/cryptography-*.whl
   else
-    echo "    WARNUNG: Kein universal2-Wheel für 'cryptography' gefunden -"
-    echo "    Verschlüsselungsfunktion läuft dann nur auf $(uname -m)-Macs."
+    echo "    FEHLER: Kein universal2-Wheel für cryptography==$CRYPTO_VER gefunden -" >&2
+    echo "    die App liefe nur auf $(uname -m)-Macs. Abbruch." >&2
+    exit 1
   fi
   rm -rf "$TMPWHL"
 
@@ -115,48 +118,70 @@ if [ "$PORTABLE" = "1" ]; then
   # diesen Fall - so bauen z.B. auch python.org/Homebrew ihre universal2-Pakete).
   echo "    Erzwinge universal2 für 'cffi' (per lipo aus Einzel-Architektur-Wheels)…"
   CFFI_VER=$(python -c "import cffi; print(cffi.__version__)" 2>/dev/null || true)
-  if [ -n "$CFFI_VER" ]; then
-    TMPCFFI=$(mktemp -d)
-    OK=1
-    pip download "cffi==$CFFI_VER" --no-deps --only-binary=:all: \
-      --platform macosx_11_0_arm64 --python-version "$PYVER" --implementation cp \
-      -d "$TMPCFFI/arm64" >/dev/null 2>&1 || OK=0
-    pip download "cffi==$CFFI_VER" --no-deps --only-binary=:all: \
-      --platform macosx_11_0_x86_64 --python-version "$PYVER" --implementation cp \
-      -d "$TMPCFFI/x86_64" >/dev/null 2>&1 || OK=0
-    if [ "$OK" = "1" ]; then
-      unzip -o -q "$TMPCFFI"/arm64/*.whl -d "$TMPCFFI/arm64/x"
-      unzip -o -q "$TMPCFFI"/x86_64/*.whl -d "$TMPCFFI/x86_64/x"
-      ARM_SO=$(find "$TMPCFFI/arm64/x" -name "_cffi_backend*.so" | head -1)
-      X86_SO=$(find "$TMPCFFI/x86_64/x" -name "_cffi_backend*.so" | head -1)
-      TARGET_SO=$(find "$VENV" -name "_cffi_backend*.so" | head -1)
-      if [ -n "$ARM_SO" ] && [ -n "$X86_SO" ] && [ -n "$TARGET_SO" ]; then
-        lipo -create "$ARM_SO" "$X86_SO" -output "$TARGET_SO"
-        echo "    universal2 _cffi_backend erzeugt ($(lipo -archs "$TARGET_SO"))."
-      else
-        echo "    WARNUNG: _cffi_backend*.so nicht gefunden - Verschlüsselung läuft"
-        echo "    dann nur auf $(uname -m)-Macs."
-      fi
+  [ -n "$CFFI_VER" ] || { echo "    FEHLER: cffi nicht installiert. Abbruch." >&2; exit 1; }
+  TMPCFFI=$(mktemp -d)
+  OK=1
+  pip download "cffi==$CFFI_VER" --no-deps --only-binary=:all: \
+    --platform macosx_11_0_arm64 --python-version "$PYVER" --implementation cp \
+    -d "$TMPCFFI/arm64" >/dev/null 2>&1 || OK=0
+  pip download "cffi==$CFFI_VER" --no-deps --only-binary=:all: \
+    --platform macosx_11_0_x86_64 --python-version "$PYVER" --implementation cp \
+    -d "$TMPCFFI/x86_64" >/dev/null 2>&1 || OK=0
+  if [ "$OK" = "1" ]; then
+    unzip -o -q "$TMPCFFI"/arm64/*.whl -d "$TMPCFFI/arm64/x"
+    unzip -o -q "$TMPCFFI"/x86_64/*.whl -d "$TMPCFFI/x86_64/x"
+    ARM_SO=$(find "$TMPCFFI/arm64/x" -name "_cffi_backend*.so" | head -1)
+    X86_SO=$(find "$TMPCFFI/x86_64/x" -name "_cffi_backend*.so" | head -1)
+    TARGET_SO=$(find "$VENV" -name "_cffi_backend*.so" | head -1)
+    if [ -n "$ARM_SO" ] && [ -n "$X86_SO" ] && [ -n "$TARGET_SO" ]; then
+      lipo -create "$ARM_SO" "$X86_SO" -output "$TARGET_SO"
+      echo "    universal2 _cffi_backend erzeugt ($(lipo -archs "$TARGET_SO"))."
     else
-      echo "    WARNUNG: cffi==$CFFI_VER nicht für beide Architekturen verfügbar -"
-      echo "    Verschlüsselungsfunktion läuft dann nur auf $(uname -m)-Macs."
+      echo "    FEHLER: _cffi_backend*.so nicht gefunden - lipo-Merge unmöglich. Abbruch." >&2
+      exit 1
     fi
-    rm -rf "$TMPCFFI"
+  else
+    echo "    FEHLER: cffi==$CFFI_VER nicht für beide Architekturen verfügbar. Abbruch." >&2
+    exit 1
   fi
+  rm -rf "$TMPCFFI"
 fi
 
 echo "==> 2/6  OUI-Herstellerliste aktualisieren (fest eingebettet)"
 mkdir -p data
-# Offizielle IEEE-Liste laden (nur um die eingebettete Liste zu aktualisieren).
-if curl -fsSL --retry 3 -o data/oui.csv "https://standards-oui.ieee.org/oui/oui.csv"; then
-  echo "    IEEE-Liste geladen ($(wc -l < data/oui.csv) Zeilen)."
-  python assets/make_oui_data.py || echo "    (Einbettung übersprungen)"
+# Offizielle IEEE-Listen (MA-L, MA-M, MA-S) laden. Erst in eine Temp-Datei,
+# streng prüfen (HTTP ok, CSV-Kopfzeile, Mindestzeilen), dann ersetzen.
+# IEEE lehnt automatische Abrufe teils ab (liefert HTML) - dann bleibt die
+# vorhandene Datei in data/; der Build bricht deshalb NICHT ab.
+# Bewusst KEIN gefälschter User-Agent/Referer.
+fetch_ieee() {  # url ziel mindestzeilen
+  local tmp lines
+  tmp=$(mktemp)
+  if curl -fsSL --retry 3 -o "$tmp" "$1" \
+     && head -1 "$tmp" | grep -q '^Registry,Assignment,' \
+     && lines=$(wc -l < "$tmp") && [ "$lines" -ge "$3" ]; then
+    mv "$tmp" "$2" && chmod 644 "$2"
+    echo "    $2 aktualisiert ($((lines)) Zeilen)."
+  else
+    rm -f "$tmp"
+    if [ -f "$2" ]; then
+      echo "    HINWEIS: IEEE-Download abgelehnt/ungültig – vorhandene $2 vom $(stat -f %Sm -t %d.%m.%Y "$2") wird genutzt."
+    else
+      echo "    HINWEIS: IEEE-Download abgelehnt/ungültig und keine $2 vorhanden."
+    fi
+  fi
+}
+fetch_ieee "https://standards-oui.ieee.org/oui/oui.csv"     data/oui.csv   30000
+fetch_ieee "https://standards-oui.ieee.org/oui28/mam.csv"   data/mam.csv   3000
+fetch_ieee "https://standards-oui.ieee.org/oui36/oui36.csv" data/oui36.csv 4000
+if [ -f data/oui.csv ] && [ -f data/mam.csv ] && [ -f data/oui36.csv ]; then
+  python assets/make_oui_data.py data/oui.csv data/mam.csv data/oui36.csv \
+    || echo "    (Einbettung übersprungen – vorhandene oui_data.py bleibt)"
 else
-  echo "    Kein Download möglich – vorhandene eingebettete Liste wird verwendet."
+  echo "    Nicht alle IEEE-Dateien da – vorhandene eingebettete Liste wird verwendet."
 fi
 
 echo "==> 3/6  App-Icon erzeugen"
-pip install pillow >/dev/null 2>&1 || true
 python assets/make_icon.py assets/ || echo "    (Icon übersprungen)"
 if [ -d assets/Netzwerk-Scanner.iconset ]; then
   iconutil -c icns assets/Netzwerk-Scanner.iconset -o assets/Netzwerk-Scanner.icns \
@@ -164,9 +189,27 @@ if [ -d assets/Netzwerk-Scanner.iconset ]; then
     || echo "    WARNUNG: iconutil fehlgeschlagen – App wird ohne eigenes Icon gebaut."
 fi
 
-echo "==> 4/6  App mit PyInstaller bauen"
+echo "==> 4/6  Selbsttest + App mit PyInstaller bauen"
+python tests/selbsttest.py || { echo "    FEHLER: Selbsttest rot – Build abgebrochen." >&2; exit 1; }
 rm -rf build dist
 pyinstaller --noconfirm NetzwerkScanner.spec
+
+# Portabler Build: JEDE Mach-O-Datei im Bundle muss arm64 UND x86_64 enthalten,
+# sonst crasht die App auf der jeweils anderen Mac-Architektur.
+if [ "$PORTABLE" = "1" ]; then
+  echo "    Prüfe Architekturen aller Mach-O-Dateien …"
+  BAD=0; N=0
+  while IFS= read -r f; do
+    N=$((N + 1))
+    archs=" $(lipo -archs "$f" 2>/dev/null) "
+    case "$archs" in *" arm64 "*) ;; *) echo "    FEHLT arm64:  $f" >&2; BAD=1;; esac
+    case "$archs" in *" x86_64 "*) ;; *) echo "    FEHLT x86_64: $f" >&2; BAD=1;; esac
+  done < <(find "dist/$APP_NAME.app" -type f -print0 | xargs -0 file --no-pad -F '|' \
+             | grep '|.*Mach-O' | cut -d'|' -f1 | grep -v ' (for architecture ' | sort -u)
+  [ "$N" -gt 0 ] || { echo "    FEHLER: keine Mach-O-Dateien gefunden?" >&2; exit 1; }
+  [ "$BAD" = "0" ] || { echo "    FEHLER: Bundle nicht universal2 – Abbruch." >&2; exit 1; }
+  echo "    $N Mach-O-Dateien, alle arm64 + x86_64."
+fi
 
 # App-Bundle neu versiegeln (OHNE --deep: das scheitert an Tcl-Datenordnern).
 # PyInstaller hat die inneren Binärdateien bereits ad-hoc signiert; hier wird

@@ -13,6 +13,8 @@ venv/
 
 # Große, generierte Herstellerdatenbank (wird von build.sh geladen)
 data/oui.csv
+data/mam.csv
+data/oui36.csv
 
 # macOS
 .DS_Store

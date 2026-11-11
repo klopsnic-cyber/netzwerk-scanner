@@ -1,0 +1,11 @@
+# Nur zum Bauen der .app/.dmg bzw. .exe nötig (nicht zur Laufzeit), exakt gepinnt
+# inkl. transitiver Abhängigkeiten. pip selbst: 26.3 (build.sh / Workflow).
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+altgraph==0.17.5
+packaging==26.2
+setuptools==83.0.0
+macholib==1.16.4 ; sys_platform == "darwin"
+pefile==2023.2.7 ; sys_platform == "win32"         # 2024.8.26 schließt PyInstaller aus
+pywin32-ctypes==0.2.3 ; sys_platform == "win32"
+pillow==12.3.0           # App-Icon (assets/make_icon.py)

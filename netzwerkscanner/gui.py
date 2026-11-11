@@ -16,6 +16,7 @@ import queue
 import subprocess
 import sys
 import threading
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
@@ -26,7 +27,7 @@ from . import __app_name__, __version__
 from . import exporter
 from . import update as update_check
 from .oui import database_size
-from .scanner import Host, ScanConfig, Scanner, guess_local_network
+from .scanner import Host, ScanConfig, Scanner, guess_local_network, hosts_in_network, _MAC_DOPPELT
 
 # --- Farbpalette (modern, hell) -------------------------------------------
 BG = "#EEF1F7"        # Fensterhintergrund
@@ -108,7 +109,7 @@ DEPTH_ORDER = ["schnell", "standard", "gruendlich"]
 # Ports, bei denen ein Doppelklick/Hover auf die Web-Oberfläche hinweist.
 WEB_PORTS = {80, 443, 8080, 8443}
 
-# Session-Persistenz (letzter Scan wird beim Beenden gesichert).
+# Session-Persistenz (Sitzung wird nach Scan/Bearbeitung/Kundendaten-Änderung gesichert).
 if sys.platform == "win32":
     SESSION_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Netzwerk-Scanner")
 else:
@@ -117,24 +118,36 @@ SESSION_FILE = os.path.join(SESSION_DIR, "last_session.json")
 
 # Spalten: (key, Überschrift, Breite, Ausrichtung)
 TREE_COLUMNS = [
-    ("icon", "", 40, "center"),
-    ("ip", "IP-Adresse", 120, "w"),
-    ("vendor", "Hersteller", 160, "w"),
-    ("device", "Gerätetyp", 190, "w"),
-    ("hostname", "Netzwerkname", 170, "w"),
-    ("mac", "MAC-Adresse", 140, "w"),
-    ("winfunc", "Windows-Funktion", 150, "w"),
-    ("ports", "Offene Ports", 150, "w"),
+    ("icon", "", 36, "center"),
+    ("ip", "IP-Adresse", 110, "w"),
+    ("vendor", "Hersteller", 140, "w"),
+    ("device", "Gerätetyp", 150, "w"),
+    ("hostname", "Netzwerkname", 140, "w"),
+    ("mac", "MAC-Adresse", 130, "w"),
+    ("winfunc", "Windows-Funktion", 130, "w"),
+    ("ports", "Offene Ports", 120, "w"),
+    ("warn", "Hinweis", 150, "w"),
 ]
+
+MAC_PRIVACY_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"
+NO_NET_HINT = "Kein Netzwerk erkannt – bitte Netz eintragen (z. B. 192.168.1.0/24)"
+GONE_WARNING = "Diesmal nicht erreichbar (Handeingaben behalten)"
+if sys.platform == "darwin":
+    PERM_HINT = ("Keine/kaum Geräte gefunden. macOS: Systemeinstellungen → Datenschutz & Sicherheit → "
+                 "Lokales Netzwerk → Netzwerk-Scanner erlauben; außerdem Netzbereich und Verbindung "
+                 "(nicht Gast-WLAN/VPN) prüfen.")
+else:
+    PERM_HINT = ("Keine/kaum Geräte gefunden. Bitte Firewall (Netzwerk-Scanner erlauben), VPN und "
+                 "den gewählten Netzbereich prüfen; Rechner muss im Praxisnetz sein (nicht Gast-WLAN).")
 
 
 def reveal_in_file_manager(path: str):
     """Zeigt eine Datei im Finder (macOS) bzw. Explorer (Windows) an."""
-    try:
+    try:  # Popen: nicht blockieren (explorer liefert ohnehin Exitcode 1)
         if sys.platform == "win32":
-            subprocess.run(["explorer", f"/select,{path}"])
+            subprocess.Popen(["explorer", f"/select,{path}"])
         else:
-            subprocess.run(["open", "-R", path])
+            subprocess.Popen(["open", "-R", path])
     except Exception:
         pass
 
@@ -154,7 +167,7 @@ def device_emoji(device_type: str, os_hint: str = "") -> str:
     if "server" in d:
         return "🖧"
     if "virtuelle" in d:
-        return "🫙"
+        return "▦"
     if "mac" in d:
         return "🍎"
     if "pc" in d or "workstation" in d or os_hint == "Windows":
@@ -168,8 +181,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{__app_name__} {__version__}")
-        self.geometry("1120x720")
-        self.minsize(940, 600)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(1120, sw - 40)}x{min(720, sh - 110)}")
+        self.minsize(min(960, sw), min(540, sh - 60))  # passt auch auf 1366x768
         self.configure(bg=BG)
 
         self.scanner: Optional[Scanner] = None
@@ -184,6 +198,18 @@ class App(tk.Tk):
         self._hover_item = None
         self._item_host = {}  # Tree-Item-ID -> Host
         self._last_status = f"Bereit · OUI-Datenbank: {database_size()} Hersteller"
+        # Handeingaben pro Gerät (IP und/oder MAC), über mehrere Scans gesammelt
+        self._notes: List[dict] = []
+        self._prev_hosts: List[Host] = []   # Ergebnis vor dem laufenden Scan
+        self._scanning = False
+        self._cancel_requested = False
+        self._scan_cidr = ""
+        self._save_job = None
+        self._session_pending = False       # Datei bleibt unberührt, bis bestätigt
+        self._pending_data = None
+        self._notices: dict = {}            # Schlüssel -> dauerhafter Hinweistext
+        self._error_seen = set()
+        self.report_callback_exception = self._tk_exception
 
         self._init_fonts()
         self._init_style()
@@ -192,6 +218,8 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_queue)
         self.after(50, self._maybe_restore_session)
+        for v in (self.var_kunde, self.var_kundennr, self.var_datum):
+            v.trace_add("write", lambda *a: self._schedule_save())
         threading.Thread(target=self._check_update_bg, daemon=True).start()
 
     # ------------------------------------------------------------- Styling
@@ -313,9 +341,14 @@ class App(tk.Tk):
         ttk.Label(b1, text="Installationsdatum").grid(row=1, column=4, sticky="w", padx=(0, 6))
         ttk.Entry(b1, textvariable=self.var_datum, width=14).grid(row=1, column=5, padx=(0, 16))
         ttk.Label(b1, text="Passwort").grid(row=1, column=6, sticky="w", padx=(0, 6))
-        ttk.Entry(b1, textvariable=self.var_passwort, width=16, show="•").grid(row=1, column=7)
+        self.ent_pw = ttk.Entry(b1, textvariable=self.var_passwort, width=16, show="•")
+        self.ent_pw.grid(row=1, column=7, padx=(0, 6))
+        self.var_show_pw = tk.BooleanVar(value=False)
+        ttk.Checkbutton(b1, text="anzeigen", variable=self.var_show_pw,
+                        command=lambda: self.ent_pw.config(show="" if self.var_show_pw.get() else "•")
+                        ).grid(row=1, column=8)
         ttk.Label(b1, text="Verschlüsselt die exportierte Excel-Datei mit diesem Kennwort (Passwortabfrage beim Öffnen), wenn ausgefüllt.",
-                 style="Muted.TLabel").grid(row=2, column=0, columnspan=8, sticky="w", pady=(6, 0))
+                 style="Muted.TLabel").grid(row=2, column=0, columnspan=9, sticky="w", pady=(6, 0))
 
         # --- Scan-Einstellungen ---------------------------------------
         c2, b2 = self._card(wrap)
@@ -323,8 +356,10 @@ class App(tk.Tk):
         ttk.Label(b2, text="Scan", style="CardTitle.TLabel").grid(
             row=0, column=0, columnspan=8, sticky="w", pady=(0, 8))
         ttk.Label(b2, text="Netzbereich (CIDR)").grid(row=1, column=0, sticky="w", padx=(0, 6))
-        self.var_cidr = tk.StringVar(value=guess_local_network())
-        ttk.Entry(b2, textvariable=self.var_cidr, width=20).grid(row=1, column=1, padx=(0, 6))
+        self.var_cidr = tk.StringVar(value=self._guess_net())
+        ent_cidr = ttk.Entry(b2, textvariable=self.var_cidr, width=20)
+        ent_cidr.grid(row=1, column=1, padx=(0, 6))
+        ent_cidr.bind("<Return>", lambda e: self._start_scan())
         ttk.Button(b2, text="Erkennen", command=self._detect_net).grid(row=1, column=2, padx=(0, 16))
         ttk.Label(b2, text="Tiefe").grid(row=1, column=3, sticky="w", padx=(0, 6))
         self.var_depth = tk.StringVar(value=DEPTH_LABELS["gruendlich"])
@@ -355,8 +390,27 @@ class App(tk.Tk):
                                         style="Accent.Horizontal.TProgressbar")
         self.progress.pack(side="left", fill="x", expand=True)
         self.var_status = tk.StringVar(value=f"Bereit · OUI-Datenbank: {database_size()} Hersteller")
-        tk.Label(prog, textvariable=self.var_status, bg=BG, fg=MUTED,
-                 font=self.f_small, anchor="w", width=52).pack(side="left", padx=12)
+        status_row = tk.Frame(wrap, bg=BG)
+        status_row.pack(fill="x", pady=(0, 6))
+        self.lbl_status = tk.Label(status_row, textvariable=self.var_status, bg=BG, fg=MUTED,
+                                   font=self.f_small, anchor="w", justify="left")
+        self.lbl_status.pack(fill="x")
+        # Dauerhafte Hinweise (Berechtigung, Scan-Probleme, Speicherfehler …)
+        self.notice_row = tk.Frame(wrap, bg="#FFF4D6", highlightbackground="#F0D58A",
+                                   highlightthickness=1)
+        self.lbl_notice = tk.Label(self.notice_row, text="", bg="#FFF4D6", fg="#6B4A00",
+                                   font=self.f_small, anchor="w", justify="left")
+        self.lbl_notice.pack(side="left", fill="x", expand=True, padx=8, pady=4)
+        self.btn_perm = tk.Button(self.notice_row, text="Einstellungen öffnen", relief="flat",
+                                  font=self.f_small, bd=0, highlightthickness=0, padx=8,
+                                  command=lambda: subprocess.Popen(["open", MAC_PRIVACY_URL]))
+        self._status_row = status_row
+
+        def _wrap(e):
+            self.lbl_status.config(wraplength=max(e.width - 20, 200))
+            self.lbl_notice.config(wraplength=max(e.width - 200, 200))
+        wrap.bind("<Configure>", _wrap)
+        self._refresh_notice()
 
         # --- Aktionen (unten fest verankert, verschwindet nie hinter der
         # Tabelle - vor der Tabelle gepackt + side="bottom") -------------
@@ -395,7 +449,7 @@ class App(tk.Tk):
             else:
                 self.tree.heading(key, text=label, command=lambda k=key: self._sort_by(k))
             self.tree.column(key, width=width, anchor=anchor,
-                             stretch=(key in ("device", "hostname", "vendor")))
+                             stretch=(key in ("device", "hostname", "vendor", "warn")))
         self._col_labels = {k: label for k, label, *_ in TREE_COLUMNS}
         self.tree.tag_configure("odd", background=CARD)
         self.tree.tag_configure("even", background=STRIPE)
@@ -408,13 +462,78 @@ class App(tk.Tk):
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<Button-2>", self._show_context_menu)
         self.tree.bind("<Button-3>", self._show_context_menu)
+        self.tree.bind("<Control-Button-1>", self._show_context_menu)  # macOS
+        self.tree.bind("<Return>", self._edit_selected)
+        self.tree.bind("<KP_Enter>", self._edit_selected)
+        self.tree.bind("<Shift-F10>", self._menu_for_selection)
+        for seq in ("<App>", "<Menu>"):  # Menütaste (je nach Plattform gültig)
+            try:
+                self.tree.bind(seq, self._menu_for_selection)
+            except tk.TclError:
+                pass
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", self._on_tree_leave)
 
-    # ------------------------------------------------------------- Aktionen
-    def _detect_net(self):
-        self.var_cidr.set(guess_local_network())
+    def _guess_net(self) -> str:
+        """Lokales Netz oder "" (dann Hinweis statt 127.x/Phantomnetz)."""
+        try:
+            cidr = guess_local_network() or ""
+        except Exception:
+            cidr = ""
+        if cidr.startswith("127."):
+            cidr = ""
+        self._notices["net"] = "" if cidr else NO_NET_HINT
+        if hasattr(self, "lbl_notice"):
+            self._refresh_notice()
+        return cidr
 
+    def _detect_net(self):
+        self.var_cidr.set(self._guess_net())
+
+    # ------------------------------------------------- Hinweise / Fehler
+    def _refresh_notice(self):
+        text = "\n".join(t for t in self._notices.values() if t)
+        self.lbl_notice.config(text=text)
+        if text:
+            self.notice_row.pack(fill="x", pady=(0, 6), after=self._status_row)
+        else:
+            self.notice_row.pack_forget()
+        if sys.platform == "darwin" and self._notices.get("perm"):
+            self.btn_perm.pack(side="right", padx=6, pady=3)
+        else:
+            self.btn_perm.pack_forget()
+
+    def _set_notice(self, key: str, text: str):
+        if self._notices.get(key, "") != text:
+            self._notices[key] = text
+            self._refresh_notice()
+
+    def _log_error(self, context: str, exc: BaseException) -> str:
+        """Schreibt einen Fehler (ohne Eingaben/Passwörter) ins Log, gibt den Pfad zurück."""
+        path = os.path.join(SESSION_DIR, "fehler.log")
+        try:
+            os.makedirs(SESSION_DIR, exist_ok=True)
+            if os.path.exists(path) and os.path.getsize(path) > 256 * 1024:
+                os.replace(path, path + ".alt")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} {__version__} {context}\n")
+                f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        except Exception:
+            pass
+        return path
+
+    def _report_error(self, context: str, exc: BaseException):
+        path = self._log_error(context, exc)
+        key = f"{context}:{exc}"
+        if key not in self._error_seen:  # gleiche Meldung nur einmal anzeigen
+            self._error_seen.add(key)
+            self._set_notice("error", f"Interner Fehler: {exc} (Details in {path})")
+
+    def _tk_exception(self, exc_type, exc, tb):
+        exc.__traceback__ = tb
+        self._report_error("Tk-Callback", exc)
+
+    # ------------------------------------------------------------- Aktionen
     def _pick_template(self):
         path = filedialog.askopenfilename(
             title="Excel-Vorlage wählen",
@@ -434,29 +553,68 @@ class App(tk.Tk):
                 return key
         return "gruendlich"
 
+    def _scan_was_cancelled(self) -> bool:
+        flag = getattr(self.scanner, "cancelled", None)
+        if flag is None and self.scanner is not None:
+            flag = self.scanner._cancel.is_set()
+        return bool(flag) or self._cancel_requested
+
     def _start_scan(self):
         if self.scan_thread and self.scan_thread.is_alive():
             return
         cidr = self.var_cidr.get().strip()
+        if not cidr:
+            messagebox.showerror("Netzbereich fehlt", NO_NET_HINT)
+            return
         try:
             net = ipaddress.ip_network(cidr, strict=False)
         except ValueError:
             messagebox.showerror("Ungültiger Netzbereich",
                                  f"'{cidr}' ist kein gültiges CIDR-Netz (z.B. 192.168.1.0/24).")
             return
-        if net.version != 4 or net.prefixlen < 22:
-            messagebox.showerror("Netzbereich zu groß",
-                                 "Bitte ein IPv4-Netz bis höchstens /22 (1022 Adressen) angeben, "
-                                 "z.B. 192.168.1.0/24. Größere Netze in Teilen scannen.")
+        try:
+            hosts_in_network(cidr)  # wirft ValueError mit deutscher Meldung (IPv6/zu groß)
+        except ValueError as e:
+            messagebox.showerror("Netzbereich nicht möglich", str(e))
+            return
+        if net.version != 4:
+            messagebox.showerror("Netzbereich nicht möglich", "Nur IPv4-Netze werden unterstützt.")
             return
 
-        # Handeingaben (Standort, User, …, Ignorieren) bleiben beim erneuten Scan erhalten
-        self._manual = {h.ip: h for h in self.hosts}
+        if self._session_pending:
+            d = self._pending_data or {}
+            if not messagebox.askyesno(
+                    "Gespeicherte Sitzung überschreiben?",
+                    "Die noch nicht wiederhergestellte Sitzung "
+                    f"({self._session_label(d)}) wird durch diesen Scan überschrieben.\n"
+                    "Die Handeingaben daraus werden übernommen. Fortfahren?"):
+                return
+            self._merge_notes_from(d)
+            self._session_pending = False
+            self._pending_data = None
+            self._set_notice("restore", "")
+        if self._notes and getattr(self, "_notes_kunde", None) not in (None, self.var_kunde.get().strip()):
+            if messagebox.askyesno("Kunde geändert",
+                                   "Der Kundenname hat sich geändert. Gespeicherte Handeingaben "
+                                   "(Standort, User …) des vorherigen Kunden verwerfen?"):
+                self._notes = []
+        self._notes_kunde = self.var_kunde.get().strip()
+
+        # Vorheriges Ergebnis sichern (Wiederherstellen bei Abbruch ohne Geräte);
+        # Handeingaben stehen dauerhaft in self._notes.
+        for h in self.hosts:
+            self._remember(h)
+        self._prev_hosts = list(self.hosts)
         self.hosts = []
         self._item_host = {}
+        self._scan_cidr = cidr
+        self._cancel_requested = False
+        self._scanning = True
         self.tree.delete(*self.tree.get_children())
         self.var_count.set("0 Geräte")
         self.var_summary.set("")
+        self._set_notice("perm", "")
+        self._set_notice("problems", "")
         self.btn_scan.config(state="disabled")
         self.btn_cancel.config(state="normal")
         self.btn_export.config(state="disabled")
@@ -472,20 +630,95 @@ class App(tk.Tk):
                     on_host=lambda h: self.msg_queue.put(("host", h)))
                 self.msg_queue.put(("done", result))
             except Exception as e:  # pragma: no cover
+                self._log_error("Scan", e)
                 self.msg_queue.put(("error", str(e)))
 
         self.scan_thread = threading.Thread(target=worker, daemon=True)
         self.scan_thread.start()
 
+    # ------------------------------------------------------- Handeingaben
     MANUAL_FIELDS = ("standort", "user", "angebunden_an", "eingerichtet_von", "ignored")
+    TEXT_FIELDS = MANUAL_FIELDS[:4]
+
+    @staticmethod
+    def _note_mac(h: Host) -> str:
+        """MAC als Schlüssel für Handeingaben – nicht bei Repeater/Proxy-ARP (eine MAC, viele Geräte)."""
+        return "" if _MAC_DOPPELT in (h.scan_warning or "") else (h.mac or "")
+
+    def _find_note(self, ip: str, mac: str) -> Optional[dict]:
+        """Eintrag per MAC (stabil), sonst per IP (nur wenn die MACs nicht widersprechen)."""
+        mac = (mac or "").lower()
+        if mac:
+            for n in self._notes:
+                if (n.get("mac") or "").lower() == mac:
+                    return n
+        for n in self._notes:
+            nm = (n.get("mac") or "").lower()
+            if n.get("ip") == ip and (not mac or not nm or nm == mac):
+                return n
+        return None
+
+    def _remember(self, h: Host):
+        """Merkt sich die Handeingaben eines Geräts (leer = Eintrag entfernen)."""
+        n = self._find_note(h.ip, self._note_mac(h))
+        if not any(getattr(h, f) for f in self.MANUAL_FIELDS):
+            if n is not None:
+                self._notes.remove(n)
+            return
+        if n is None:
+            n = {}
+            self._notes.append(n)
+        n.update(ip=h.ip, mac=self._note_mac(h), vendor=h.vendor or n.get("vendor", ""),
+                 hostname=h.hostname or n.get("hostname", ""),
+                 device_type=h.device_type or n.get("device_type", ""),
+                 **{f: getattr(h, f) for f in self.MANUAL_FIELDS})
 
     def _carry_manual(self, h: Host):
-        old = getattr(self, "_manual", {}).get(h.ip)
-        if old is not None and old is not h:
+        n = self._find_note(h.ip, self._note_mac(h))
+        if n is not None:
+            n["ip"] = h.ip  # DHCP: gleiche MAC, neue IP
             for f in self.MANUAL_FIELDS:
-                setattr(h, f, getattr(old, f))
+                if f in n:
+                    setattr(h, f, n[f])
+
+    def _merge_notes_from(self, data: dict):
+        """Übernimmt Handeingaben aus einer Sitzungsdatei (alte Dateien: aus den Hosts)."""
+        for n in data.get("handeingaben", []) or []:
+            if isinstance(n, dict) and n.get("ip") and not self._find_note(n["ip"], n.get("mac", "")):
+                self._notes.append(n)
+        for d in data.get("hosts", []) or []:
+            try:
+                self._remember(Host.from_dict(d))
+            except Exception:
+                pass
+
+    def _gone_hosts(self, found: List[Host], cidr: str) -> List[Host]:
+        """Geräte mit Handeingaben, die diesmal nicht geantwortet haben."""
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            return []
+        seen = {id(self._find_note(h.ip, self._note_mac(h))) for h in found}
+        out = []
+        for n in self._notes:
+            if id(n) in seen or n.get("ignored") or not any(n.get(f) for f in self.TEXT_FIELDS):
+                continue
+            try:
+                if ipaddress.ip_address(n.get("ip", "")) not in net:
+                    continue
+            except ValueError:
+                continue
+            g = Host(ip=n["ip"], mac=n.get("mac", ""), vendor=n.get("vendor", ""),
+                     hostname=n.get("hostname", ""), device_type=n.get("device_type", ""),
+                     scan_warning=GONE_WARNING)
+            for f in self.MANUAL_FIELDS:
+                setattr(g, f, n.get(f, getattr(g, f)))
+            g.ignored = False
+            out.append(g)
+        return out
 
     def _cancel_scan(self):
+        self._cancel_requested = True
         if self.scanner:
             self.scanner.cancel()
         self.var_status.set("Abbruch angefordert …")
@@ -494,67 +727,149 @@ class App(tk.Tk):
     def _on_close(self):
         if self.scan_thread and self.scan_thread.is_alive():
             self._cancel_scan()
-        if self.hosts:
-            self._save_session()
+        self._save_session()
         self.destroy()
 
-    def _save_session(self):
-        try:
-            os.makedirs(SESSION_DIR, exist_ok=True)
-            data = {
-                "kunde": self.var_kunde.get(),
-                "kundennr": self.var_kundennr.get(),
-                "datum": self.var_datum.get(),
-                "hosts": [h.to_dict() for h in self.hosts],
-            }
-            with open(SESSION_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass  # Session-Sicherung ist ein Komfortfeature, kein Beinbruch
+    def _schedule_save(self):
+        """Entprellt: Kundendaten-Änderungen werden 1,5 s nach dem letzten Tastendruck gesichert."""
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(1500, self._save_session)
 
-    def _maybe_restore_session(self):
+    def _save_session(self) -> bool:
+        if self._save_job is not None:
+            try:
+                self.after_cancel(self._save_job)
+            except Exception:
+                pass
+            self._save_job = None
+        if self._session_pending:  # ältere Sitzung noch nicht entschieden: nicht überschreiben
+            return False
+        hosts = self._prev_hosts if self._scanning else self.hosts
+        if not hosts and not self._notes:
+            return False
+        for h in hosts:
+            self._remember(h)
+        data = {
+            "kunde": self.var_kunde.get(),
+            "kundennr": self.var_kundennr.get(),
+            "datum": self.var_datum.get(),
+            "gespeichert_am": datetime.datetime.now().isoformat(timespec="seconds"),
+            "handeingaben_kunde": getattr(self, "_notes_kunde", self.var_kunde.get().strip()),
+            "hosts": [h.to_dict() for h in hosts],
+            "handeingaben": self._notes,
+        }
+        tmp = SESSION_FILE + ".tmp"
+        try:
+            os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, SESSION_FILE)  # atomar: nie eine halbe Datei
+        except Exception as e:
+            self._log_error("Sitzung speichern", e)
+            self._set_notice("save", f"Sitzung konnte nicht gespeichert werden: {e}")
+            return False
+        self._set_notice("save", "")
+        return True
+
+    def _session_label(self, data: dict) -> str:
+        kunde = (data.get("kunde") or "").strip() or "ohne Kundenname"
+        when = data.get("gespeichert_am")
+        try:
+            when = datetime.datetime.fromisoformat(when).strftime("%d.%m.%Y %H:%M")
+        except (TypeError, ValueError):
+            try:
+                ts = datetime.datetime.fromtimestamp(os.path.getmtime(SESSION_FILE))
+                when = ts.strftime("%d.%m.%Y %H:%M") + " (Dateidatum)"
+            except OSError:
+                when = "unbekannt"
+        return f"Kunde: {kunde}, gespeichert: {when}, {len(data.get('hosts', []) or [])} Geräte"
+
+    def _read_session(self) -> Optional[dict]:
         if not os.path.exists(SESSION_FILE):
-            return
-        if not messagebox.askyesno("Sitzung wiederherstellen",
-                                   "Letzten Scan wiederherstellen?"):
-            return
+            return None
         try:
             with open(SESSION_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Sitzungsdatei hat ein unerwartetes Format")
+            return data
+        except Exception as e:
+            try:
+                os.replace(SESSION_FILE, SESSION_FILE + ".defekt")
+            except OSError:
+                pass
+            messagebox.showerror("Sitzung nicht lesbar",
+                                 f"{e}\n\nDie Datei wurde als last_session.json.defekt beiseitegelegt.")
+            return None
+
+    def _maybe_restore_session(self):
+        data = self._read_session()
+        if data is None:
+            return
+        ans = messagebox.askyesnocancel(
+            "Sitzung wiederherstellen",
+            f"Gespeicherte Sitzung gefunden:\n{self._session_label(data)}\n\n"
+            "Ja = wiederherstellen\nNein = verwerfen (Datei wird gelöscht)\n"
+            "Abbrechen = später entscheiden (Datei bleibt unverändert)")
+        if ans:
+            self._apply_session(data)
+        elif ans is False and messagebox.askyesno(
+                "Sitzung verwerfen?", "Gespeicherte Sitzung wirklich löschen? Das lässt sich nicht rückgängig machen."):
+            try:
+                os.remove(SESSION_FILE)
+            except OSError as e:
+                self._set_notice("save", f"Sitzungsdatei nicht löschbar: {e}")
+        else:  # Abbrechen oder Rückfrage verneint: Datei behalten, nicht überschreiben
+            self._session_pending = True
+            self._pending_data = data
+            self._set_notice("restore", "Gespeicherte Sitzung noch nicht wiederhergestellt – sie wird erst "
+                                        "nach Bestätigung beim nächsten Scan überschrieben.")
+
+    def _apply_session(self, data: dict):
+        try:
+            hosts = [Host.from_dict(d) for d in data.get("hosts", [])]
             self.var_kunde.set(data.get("kunde", ""))
             self.var_kundennr.set(data.get("kundennr", ""))
             self.var_datum.set(data.get("datum", ""))
-            self.hosts = [Host.from_dict(d) for d in data.get("hosts", [])]
+            self._notes_kunde = data.get("handeingaben_kunde", data.get("kunde", "")).strip()
+            self.hosts = hosts
+            self._merge_notes_from(data)
             self._rebuild_tree()
             self._set_counts()
             if self.hosts:
                 self.btn_export.config(state="normal")
             self._update_summary()
         except Exception as e:
+            self._log_error("Sitzung laden", e)
             messagebox.showerror("Wiederherstellen fehlgeschlagen", str(e))
 
     def _export(self):
         if not self.hosts:
             return
+        pw = self.var_passwort.get()
+        if pw:  # Wiederholung VOR dem Dateidialog
+            again = simpledialog.askstring(
+                "Passwort bestätigen", "Passwort für die Excel-Datei bitte wiederholen:",
+                show="" if self.var_show_pw.get() else "•", parent=self)
+            if again is None:
+                return
+            if again != pw:
+                messagebox.showerror("Passwort", "Die Passwörter stimmen nicht überein. Nichts gespeichert.")
+                return
         fname = exporter.suggested_filename(self.var_kunde.get())
         path = filedialog.asksaveasfilename(
             title="Netzwerkdoku speichern", defaultextension=".xlsx",
             initialfile=fname, filetypes=[("Excel", "*.xlsx")])
         if not path:
             return
-        pw = self.var_passwort.get()
-        if pw:
-            again = simpledialog.askstring("Passwort bestätigen",
-                                           "Passwort für die Excel-Datei bitte wiederholen:",
-                                           show="•", parent=self)
-            if again is None:
-                return
-            if again != pw:
-                messagebox.showerror("Passwort", "Die Passwörter stimmen nicht überein. Nichts gespeichert.")
-                return
+        self.btn_export.config(state="disabled")
+        self.update_idletasks()
         try:
             exporter.export(
-                self.hosts, path, template_path=self.template_path,
+                [h for h in self.hosts if GONE_WARNING not in (h.scan_warning or "")], path, template_path=self.template_path,
                 kundenname=self.var_kunde.get(), kundennummer=self.var_kundennr.get(),
                 installationsdatum=self.var_datum.get(), passwort=pw)
         except PermissionError:
@@ -563,11 +878,19 @@ class App(tk.Tk):
                                  "Bitte schließen und erneut speichern.")
             return
         except Exception as e:
+            self._log_error("Export", e)
             messagebox.showerror("Export fehlgeschlagen", str(e))
             return
+        finally:
+            if self.hosts and not self._scanning:
+                self.btn_export.config(state="normal")
         art = "verschlüsselt mit Passwort" if pw else "ohne Passwort"
+        gone = sum(1 for h in self.hosts if GONE_WARNING in (h.scan_warning or ""))
+        ign = sum(1 for h in self.hosts if h.ignored and GONE_WARNING not in (h.scan_warning or ""))
         manager = "Finder" if sys.platform == "darwin" else "Explorer"
         if messagebox.askyesno("Fertig",
+                               f"{len(self.hosts) - ign - gone} Geräte exportiert, {ign} ignoriert"
+                               + (f", {gone} nicht erreichbare nicht übernommen" if gone else "") + ".\n"
                                f"Gespeichert ({art}):\n{path}\n\nIm {manager} anzeigen?"):
             reveal_in_file_manager(path)
 
@@ -576,7 +899,7 @@ class App(tk.Tk):
         ports = ", ".join(str(p) for p in sorted(h.open_ports))
         icon = "⚠" if h.scan_warning else device_emoji(h.device_type, h.os_hint)
         return (icon, h.ip, h.vendor,
-                h.device_type, h.hostname, h.mac, h.win_function, ports)
+                h.device_type, h.hostname, h.mac, h.win_function, ports, h.scan_warning)
 
     def _add_host_row(self, h: Host):
         tag = "even" if len(self.tree.get_children()) % 2 else "odd"
@@ -624,7 +947,9 @@ class App(tk.Tk):
                     return (0, int(ipaddress.ip_address(h.ip)))
                 except ValueError:
                     return (1, 0)
-            return (str(v) == "", str(v).lower())
+            if key == "ports":  # numerisch nach kleinster Portnummer, ohne Ports zuletzt
+                return (0, min(h.open_ports)) if h.open_ports else (1, 0)
+            return (str(v) == "", str(v).casefold())
 
         self.hosts.sort(key=sort_key, reverse=reverse)
         self._sort_state[key] = not reverse
@@ -643,15 +968,31 @@ class App(tk.Tk):
     def _on_double_click(self, event):
         item = self.tree.identify_row(event.y)
         h = self._item_host.get(item) if item else None
-        if not h or not self._has_web_port(h):
-            return
-        scheme = "https" if (443 in h.open_ports or 8443 in h.open_ports) else "http"
-        webbrowser.open(f"{scheme}://{h.ip}")
+        if h:
+            self._edit_host(h)
+
+    def _edit_selected(self, event=None):
+        sel = self.tree.selection()
+        h = self._item_host.get(sel[0]) if sel else None
+        if h:
+            self._edit_host(h)
+        return "break"
+
+    def _menu_for_selection(self, event=None):
+        sel = self.tree.selection()
+        if sel:
+            x, y, w, hgt = self.tree.bbox(sel[0]) or (0, 0, 0, 0)
+            self._popup_menu(sel[0], self.tree.winfo_rootx() + x + 40,
+                             self.tree.winfo_rooty() + y + hgt)
+        return "break"
 
     def _show_context_menu(self, event):
         item = self.tree.identify_row(event.y)
-        if not item:
-            return
+        if item:
+            self._popup_menu(item, event.x_root, event.y_root)
+        return "break"
+
+    def _popup_menu(self, item, x_root, y_root):
         h = self._item_host.get(item)
         if h is None:
             return
@@ -665,25 +1006,29 @@ class App(tk.Tk):
         label = "Nicht mehr ignorieren" if h.ignored else "Ignorieren"
         menu.add_command(label=label, command=lambda: self._toggle_ignored(h))
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x_root, y_root)
         finally:
             menu.grab_release()
 
     def _toggle_ignored(self, h: Host):
         h.ignored = not h.ignored
+        self._remember(h)
         self._rebuild_tree()
         self._set_counts()
+        self._save_session()
 
     def _edit_host(self, h: Host):
         dlg = tk.Toplevel(self)
         dlg.title(f"Bearbeiten – {h.ip}")
         dlg.configure(bg=BORDER)
         dlg.transient(self)
-        dlg.resizable(False, False)
+        dlg.resizable(True, True)
+        dlg.minsize(380, 240)
         inner = tk.Frame(dlg, bg=CARD)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         body = tk.Frame(inner, bg=CARD)
         body.pack(fill="both", expand=True, padx=18, pady=16)
+        body.columnconfigure(1, weight=1)
 
         title = h.hostname or h.vendor or h.device_type or "Gerät"
         ttk.Label(body, text=f"{h.ip} · {title}", style="CardTitle.TLabel").grid(
@@ -701,7 +1046,11 @@ class App(tk.Tk):
         ]
         for i, (label, var) in enumerate(rows, start=1):
             ttk.Label(body, text=label).grid(row=i, column=0, sticky="w", padx=(0, 10), pady=4)
-            ttk.Entry(body, textvariable=var, width=28).grid(row=i, column=1, pady=4)
+            ttk.Entry(body, textvariable=var, width=28).grid(row=i, column=1, pady=4, sticky="ew")
+        if h.scan_warning:
+            tk.Label(body, text=f"⚠ {h.scan_warning}", bg=CARD, fg="#9A5B00", font=self.f_small,
+                     justify="left", anchor="w", wraplength=340).grid(
+                row=len(rows) + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         def save():
             h.standort = var_standort.get()
@@ -709,24 +1058,26 @@ class App(tk.Tk):
             h.angebunden_an = var_verbunden.get()
             h.eingerichtet_von = var_eingerichtet.get()
             dlg.destroy()
+            self._remember(h)
             self._rebuild_tree()
+            self._save_session()
 
         btns = tk.Frame(body, bg=CARD)
-        btns.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        btns.grid(row=len(rows) + 2, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(btns, text="Abbrechen", command=dlg.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(btns, text="Speichern", style="Accent.TButton", command=save).pack(side="right")
+        dlg.bind("<Return>", lambda e: save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
         dlg.grab_set()
 
     def _on_tree_motion(self, event):
         item = self.tree.identify_row(event.y)
         h = self._item_host.get(item) if item else None
         self.var_status.set(h.scan_warning if (h and h.scan_warning) else self._last_status)
-        self.tree.configure(cursor="hand2" if (h and self._has_web_port(h)) else "")
         self._set_hover(item)
 
     def _on_tree_leave(self, event):
         self.var_status.set(self._last_status)
-        self.tree.configure(cursor="")
         self._set_hover(None)
 
     def _set_hover(self, item):
@@ -754,7 +1105,7 @@ class App(tk.Tk):
                 try:
                     self._handle_message(item)
                 except Exception as e:  # nie das Polling sterben lassen
-                    print("Fehler bei", item[0], ":", e, file=sys.stderr)
+                    self._report_error(f"Nachricht {item[0]}", e)
         except queue.Empty:
             pass
         finally:
@@ -771,17 +1122,16 @@ class App(tk.Tk):
             h = item[1]
             self._carry_manual(h)
             self.hosts.append(h)
-            self._add_host_row(h)
+            q = self.var_filter.get().strip().lower()
+            if not q or self._matches_filter(h, q):  # Zebra zählt nur sichtbare Zeilen
+                self._add_host_row(h)
             self._set_counts()
         elif kind == "done":
-            self.hosts = item[1] or self.hosts or list(getattr(self, "_manual", {}).values())
-            for h in self.hosts:
-                self._carry_manual(h)
-            self._rebuild_tree()  # Sortierung/Filter wieder deckungsgleich mit self.hosts
-            self._finish_scan()
+            self._finish_scan(item[1] or [])
         elif kind == "error":
-            messagebox.showerror("Scan-Fehler", item[1])
-            self._finish_scan()
+            self._report_error("Scan", RuntimeError(item[1]))
+            messagebox.showerror("Scan-Fehler", f"{item[1]}\n\n(Details in {os.path.join(SESSION_DIR, 'fehler.log')})")
+            self._finish_scan([], failed=True)
         elif kind == "update":
             self._on_update_result(item[1], manual=item[2], error=item[3])
         elif kind == "install_progress":
@@ -874,23 +1224,60 @@ class App(tk.Tk):
                 "Stattdessen die Release-Seite im Browser öffnen (manueller Download)?"):
             webbrowser.open(self._update_info["url"])
 
-    def _finish_scan(self):
+    def _finish_scan(self, result: Optional[List[Host]] = None, failed: bool = False):
+        """Ergebnis übernehmen. Alte Geräte erscheinen nie als neues Ergebnis."""
+        self._scanning = False
+        cancelled = self._scan_was_cancelled()
+        found = list(result or self.hosts)  # self.hosts = bisher gestreamte Treffer dieses Scans
+        for h in found:
+            self._carry_manual(h)
+        problems = list(getattr(self.scanner, "last_problems", None) or [])
+        msg = ""
+        if not found and (cancelled or failed):
+            self.hosts = list(self._prev_hosts)  # vorheriges Ergebnis wiederherstellen
+            what = "Scan abgebrochen" if cancelled else "Scan fehlgeschlagen"
+            msg = (f"{what} – vorheriges Ergebnis wiederhergestellt." if self.hosts
+                   else f"{what} – keine Geräte gefunden.")
+        elif cancelled or failed:
+            self.hosts = found
+            msg = f"{'Abgebrochen' if cancelled else 'Scan fehlgeschlagen'} – {len(found)} Geräte (unvollständig)."
+        else:
+            gone = self._gone_hosts(found, self._scan_cidr)
+            self.hosts = sorted(found + gone, key=lambda x: x.sort_key())
+            msg = f"Fertig – {len(found)} Geräte" + (
+                f", {len(gone)} diesmal nicht erreichbar (nur Handeingaben)." if gone else ".")
+            if not found:
+                msg = "Keine Geräte gefunden – Tabelle leer (vorheriges Ergebnis wird nicht angezeigt)."
+        self._prev_hosts = []
+        self._rebuild_tree()  # Sortierung/Filter wieder deckungsgleich mit self.hosts
         self.btn_scan.config(state="normal")
         self.btn_cancel.config(state="disabled")
-        if self.hosts:
-            self.btn_export.config(state="normal")
+        self.btn_export.config(state="normal" if self.hosts else "disabled")
         self._set_counts()
         self._update_summary()
-        if self.scanner and self.scanner._cancel.is_set():
-            self._last_status = f"Abgebrochen – {len(self.hosts)} Geräte (unvollständig)."
-            self.var_status.set(self._last_status)
-        elif len(self.hosts) <= 1:
-            messagebox.showinfo(
-                "Kaum Geräte gefunden",
-                "Es wurde (fast) nichts gefunden. Bitte prüfen:\n"
-                "• Stimmt der Netzbereich?\n• Ist der Rechner mit dem Praxisnetz verbunden (nicht Gast-WLAN/VPN)?\n"
-                "• macOS: Systemeinstellungen → Datenschutz & Sicherheit → Lokales Netzwerk → "
-                "Netzwerk-Scanner erlauben.")
+        self._last_status = msg
+        self.var_status.set(msg)
+
+        few = not cancelled and len(found) <= 1
+        self._set_notice("perm", PERM_HINT if few else "")
+        self._set_notice("problems", "⚠ " + "\n⚠ ".join(problems) if problems else "")
+        self._save_session()
+        parts = []
+        if few:
+            parts.append("Es wurde (fast) nichts gefunden. Bitte prüfen:\n"
+                         "• Stimmt der Netzbereich?\n• Ist der Rechner mit dem Praxisnetz verbunden (nicht Gast-WLAN/VPN)?\n"
+                         + ("• macOS: Systemeinstellungen → Datenschutz & Sicherheit → Lokales Netzwerk → "
+                            "Netzwerk-Scanner erlauben." if sys.platform == "darwin"
+                            else "• Firewall/VPN prüfen; Netzwerk-Scanner in der Windows-Firewall zulassen."))
+        if problems:
+            parts.append("Hinweise zum Scan:\n• " + "\n• ".join(problems))
+        if parts:
+            text = "\n\n".join(parts)
+            if few and sys.platform == "darwin":
+                if messagebox.askyesno("Hinweise zum Scan", text + "\n\nSystemeinstellungen jetzt öffnen?"):
+                    subprocess.Popen(["open", MAC_PRIVACY_URL])
+            else:
+                messagebox.showwarning("Hinweise zum Scan", text)
 
 
 def main():

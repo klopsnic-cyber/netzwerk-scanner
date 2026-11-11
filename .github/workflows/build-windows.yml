@@ -6,6 +6,11 @@ name: Windows-Build
 # Läuft automatisch bei jedem "vX.Y.Z"-Tag (also bei jedem
 # "gh release create vX.Y.Z ...") und hängt die .zip direkt an die Release
 # an. Manuell auslösbar über workflow_dispatch, optional mit Ziel-Tag.
+#
+# Rechte getrennt: "build" führt Projektcode und pip-Pakete aus und darf
+# daher NUR lesen. "upload" hat Schreibrecht, führt aber keinen Projektcode
+# aus (kein Checkout, kein pip) - lädt nur das fertige Artifact hoch.
+# Alle Actions sind auf Commit-SHAs gepinnt (Tag als Kommentar).
 
 on:
   push:
@@ -17,28 +22,30 @@ on:
         description: 'Release-Tag zum Anhängen (z.B. v1.2.0). Leer = nur als Artifact.'
         required: false
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
-      - name: Abhängigkeiten installieren
+      - name: Abhängigkeiten installieren (exakte Versionen)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pillow
+          python -m pip install pip==26.3
+          python -m pip install -r requirements.txt -r requirements-build.txt
 
-      - name: MAC-Auswertung auf echtem Windows prüfen
+      - name: Selbsttest + MAC-Auswertung auf echtem Windows prüfen
         run: |
-          python tests/selbsttest_mac.py
+          python tests/selbsttest.py
           python -c "from netzwerkscanner.scanner import read_arp_table, own_mac, get_local_ip; ip=get_local_ip(); t=read_arp_table(); m=own_mac(ip); print('eigene IP', ip, 'MAC', m, '| ARP-Einträge', len(t)); assert m, 'eigene MAC fehlt'; assert t, 'ARP-Tabelle leer'"
 
       - name: Icon erzeugen
@@ -52,14 +59,24 @@ jobs:
         run: Compress-Archive -Path dist/Netzwerk-Scanner -DestinationPath Netzwerk-Scanner-Windows.zip
 
       - name: Als Artifact hochladen
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Netzwerk-Scanner-Windows
           path: Netzwerk-Scanner-Windows.zip
+          if-no-files-found: error
+
+  upload:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Netzwerk-Scanner-Windows
 
       - name: An Release anhängen
-        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}

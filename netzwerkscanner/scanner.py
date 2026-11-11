@@ -18,23 +18,47 @@ from __future__ import annotations
 import concurrent.futures
 import errno
 import ipaddress
-import itertools
 import os
 import platform
 import re
+import selectors
 import socket
-import struct
 import subprocess
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .oui import lookup_vendor
 from .classify import classify_device
 
 # Windows: ping/arp ohne aufblitzendes Konsolenfenster starten (GUI-Build hat keine Konsole).
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+WINDOWS = os.name == "nt"
+
+
+def _systemprogramm(*kandidaten: str) -> str:
+    """Erster vorhandener fester Pfad, sonst der letzte Kandidat (Name über PATH).
+    Als gebaute App fehlt oft /sbin bzw. /usr/sbin im PATH; unter Windows soll keine
+    gleichnamige Datei aus dem Arbeitsordner statt des Systemprogramms starten."""
+    for pfad in kandidaten[:-1]:
+        if os.path.exists(pfad):
+            return pfad
+    return kandidaten[-1]
+
+
+_SYS32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+if WINDOWS:
+    PING = _systemprogramm(os.path.join(_SYS32, "ping.exe"), "ping")
+    ARP = _systemprogramm(os.path.join(_SYS32, "arp.exe"), "arp")
+    POWERSHELL = _systemprogramm(os.path.join(_SYS32, "WindowsPowerShell", "v1.0", "powershell.exe"), "powershell")
+    IFCONFIG = ""
+else:
+    PING = _systemprogramm("/sbin/ping", "/bin/ping", "ping")
+    # Ohne festen Pfad fand die gebaute .app "arp" nicht -> alle MACs leer.
+    ARP = _systemprogramm("/usr/sbin/arp", "/sbin/arp", "arp")
+    POWERSHELL = ""
+    IFCONFIG = _systemprogramm("/sbin/ifconfig", "ifconfig")
 
 # macOS-GUI-Apps starten mit nur 256 Dateihandles; 128 parallele Pings/Sockets reißen das,
 # und die betroffenen Hosts fielen still aus dem Ergebnis. Soft-Limit anheben (best effort).
@@ -108,10 +132,11 @@ COMMON_PORTS: Dict[int, str] = {
     2049: "NFS", 3268: "LDAP-GC", 3306: "MySQL/MariaDB", 3389: "RDP",
     5432: "PostgreSQL", 5900: "VNC", 5985: "WinRM", 8080: "HTTP-Alt",
     8443: "HTTPS-Alt", 9100: "RAW/Drucker", 32400: "Plex",
+    62078: "Apple-Gerät (iOS)",
 }
 
 # Reduzierter Portsatz für den schnellen Modus.
-QUICK_PORTS = [22, 80, 135, 139, 443, 445, 515, 631, 3389, 9100]
+QUICK_PORTS = [22, 80, 135, 139, 443, 445, 515, 631, 3389, 9100, 62078]
 
 # Ports, an denen ein Banner-Grab sinnvoll ist.
 BANNER_PORTS = {21, 22, 25, 80, 110, 143, 443, 8080, 8443}
@@ -141,31 +166,60 @@ class ScanConfig:
 # Subnetz-Erkennung
 # ---------------------------------------------------------------------------
 
-def get_local_ip() -> str:
-    """Ermittelt die primäre lokale IPv4-Adresse (ohne echten Traffic)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _brauchbare_ip(ip: str) -> bool:
     try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        a = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return not (a.is_loopback or a.is_unspecified or a.is_link_local)
+
+
+def local_ip_for(target_ip: str) -> str:
+    """Eigene IPv4-Adresse, über die das System `target_ip` erreichen würde
+    (richtige Netzwerkkarte auch bei VPN/mehreren Karten). Es wird kein Paket
+    gesendet – connect() auf UDP wählt nur die Route. "" wenn keine Route/IP."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((target_ip, 9))
+            ip = s.getsockname()[0]
+    except (OSError, ValueError):
+        return ""
+    return ip if _brauchbare_ip(ip) else ""
+
+
+def get_local_ip() -> str:
+    """Primäre lokale IPv4-Adresse (Default-Route). "" wenn keine brauchbare IP
+    da ist (kein Netz, keine Default-Route) – NICHT still 127.0.0.1."""
+    return local_ip_for("8.8.8.8")
 
 
 def guess_local_network(prefix: int = 24) -> str:
-    """Rät das lokale /24-Netz aus der eigenen IP, z.B. '192.168.1.0/24'."""
+    """Rät das lokale Netz aus der eigenen IP, z.B. '192.168.1.0/24'.
+    "" wenn keine brauchbare eigene IP ermittelbar ist (GUI zeigt dann einen Hinweis)."""
     ip = get_local_ip()
+    if not ip:
+        return ""
+    return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))
+
+
+MAX_ADRESSEN = 1024  # = /22 (1022 nutzbare Adressen)
+
+
+def hosts_in_network(cidr: str) -> List[str]:
+    """Alle Host-Adressen des Netzes. ValueError mit verständlicher deutscher Meldung
+    bei ungültiger Angabe, IPv6 oder zu großem Netz (keine stille Kappung)."""
     try:
-        net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
-        return str(net)
+        net = ipaddress.ip_network(cidr.strip(), strict=False)
     except ValueError:
-        return "192.168.1.0/24"
-
-
-def hosts_in_network(cidr: str, limit: int = 1024) -> List[str]:
-    net = ipaddress.ip_network(cidr, strict=False)
-    return [str(h) for h in itertools.islice(net.hosts(), limit)]
+        raise ValueError(f"Ungültige Netzangabe „{cidr}“ – bitte z. B. 192.168.1.0/24 eingeben.") from None
+    if net.version != 4:
+        raise ValueError("Nur IPv4-Netze werden unterstützt (z. B. 192.168.1.0/24).")
+    if net.num_addresses > MAX_ADRESSEN:
+        beispiel = ipaddress.ip_network(f"{net.network_address}/24", strict=False)
+        raise ValueError(
+            f"Netz zu groß: /{net.prefixlen} hat {net.num_addresses - 2} Adressen, "
+            f"maximal /22 (1022). Bitte ein kleineres Netz wählen, z. B. {beispiel}.")
+    return [str(h) for h in net.hosts()]
 
 
 # ---------------------------------------------------------------------------
@@ -175,26 +229,28 @@ def hosts_in_network(cidr: str, limit: int = 1024) -> List[str]:
 def _ping_cmd(ip: str, timeout: float) -> List[str]:
     system = platform.system().lower()
     if system == "windows":
-        return ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+        return [PING, "-n", "1", "-w", str(int(timeout * 1000)), ip]
     if system == "darwin":
         # -t Gesamt-Timeout in Sekunden auf macOS
-        return ["ping", "-c", "1", "-t", str(max(1, int(timeout))), ip]
+        return [PING, "-c", "1", "-t", str(max(1, int(timeout))), ip]
     # Linux
-    return ["ping", "-c", "1", "-W", str(max(1, int(timeout))), ip]
+    return [PING, "-c", "1", "-W", str(max(1, int(timeout))), ip]
 
 
 def ping(ip: str, timeout: float = 1.0) -> bool:
+    """True bei Ping-Antwort. FileNotFoundError (ping fehlt) und andere OSError
+    (z. B. keine Dateihandles mehr) werden weitergegeben – der Aufrufer meldet sie."""
     try:
         res = subprocess.run(
             _ping_cmd(ip, timeout),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=timeout + 1.5, **NO_WINDOW,
         )
-        # Windows-ping meldet Exit 0 auch bei "Zielhost nicht erreichbar" (Antwort vom Router);
-        # nur eine echte Antwort enthält "TTL=" (sprachunabhängig).
-        return res.returncode == 0 and (os.name != "nt" or b"TTL=" in res.stdout.upper())
-    except Exception:
+    except subprocess.TimeoutExpired:
         return False
+    # Windows-ping meldet Exit 0 auch bei "Zielhost nicht erreichbar" (Antwort vom Router);
+    # nur eine echte Antwort enthält "TTL=" (sprachunabhängig).
+    return res.returncode == 0 and (os.name != "nt" or b"TTL=" in res.stdout.upper())
 
 
 # Ports für die aktive Erreichbarkeitsprüfung, falls ein Gerät Ping blockt.
@@ -208,31 +264,68 @@ LIVENESS_PORTS = (
     53, 8080,                          # Gateway/DNS, Web-Alt
 )
 
+# Gesamt-Timeout für alle Ports zusammen. Gemessen: schlafende iPhones/iPads (WLAN-Stromsparen)
+# antworten erst nach 1–1,5 s; Windows meldet ein abgelehntes connect() (RST) ebenfalls erst
+# nach ~1 s. Mit 0.6 s fielen solche Geräte aus dem Ergebnis.
+TCP_TIMEOUT = 1.5
+_ABGELEHNT = {errno.ECONNREFUSED, 10061}  # 10061 = WSAECONNREFUSED
+_LAEUFT = {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, 10035}  # 10035 = WSAEWOULDBLOCK
 
-def tcp_reachable(ip: str, timeout: float = 0.5, ports=LIVENESS_PORTS) -> bool:
+
+def tcp_reachable(ip: str, timeout: Optional[float] = None, ports=LIVENESS_PORTS) -> bool:
     """True, wenn der Host auf mind. einem TCP-Port jetzt reagiert
-    (Verbindung offen oder aktiv abgelehnt = Host lebt gerade)."""
-    for port in ports:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        try:
+    (Verbindung offen oder aktiv abgelehnt = Host lebt gerade).
+
+    Alle Ports gleichzeitig (nicht blockierend) mit EINEM Gesamt-Timeout statt
+    nacheinander. selectors statt select.select: bei vielen parallelen Prüfungen
+    liegen die Dateinummern über 1024, das verträgt select() auf macOS/Linux nicht.
+    OSError beim Anlegen (z. B. EMFILE) wird weitergegeben, nicht verschluckt."""
+    timeout = TCP_TIMEOUT if timeout is None else timeout
+    socks: List[socket.socket] = []
+    sel = selectors.DefaultSelector()
+    try:
+        for port in ports:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            socks.append(s)
+            s.setblocking(False)
             rc = s.connect_ex((ip, port))
-            if rc == 0 or rc == errno.ECONNREFUSED:
+            if rc == 0 or rc in _ABGELEHNT:
                 return True
-        except Exception:
-            pass
-        finally:
+            if rc in _LAEUFT:
+                sel.register(s, selectors.EVENT_WRITE)
+            # sonst (z. B. Netz/Host unerreichbar): dieser Port zählt nicht
+        deadline = time.monotonic() + timeout
+        while sel.get_map():
+            rest = deadline - time.monotonic()
+            if rest <= 0:
+                break
+            for key, _ in sel.select(rest):
+                s = key.fileobj
+                err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err == 0 or err in _ABGELEHNT:
+                    return True
+                sel.unregister(s)
+        return False
+    finally:
+        sel.close()
+        for s in socks:
             s.close()
-    return False
 
 
-def probe(ip: str, timeout: float = 1.0) -> bool:
+_PING_FEHLT = "Ping-Programm nicht gefunden – Erreichbarkeit nur per TCP geprüft"
+
+
+def probe(ip: str, timeout: float = 1.0, problems: Optional[List[str]] = None) -> bool:
     """Ist der Host JETZT aktiv erreichbar? Erst Ping (auch subnetzübergreifend),
     dann als Rückfall ein aktiver TCP-Kontakt. Keine ARP-Cache-Auswertung –
     es werden nur Geräte gemeldet, die zur Scan-Zeit tatsächlich antworten."""
-    if ping(ip, timeout):
-        return True
-    return tcp_reachable(ip, min(timeout, 0.5))
+    try:
+        if ping(ip, timeout):
+            return True
+    except FileNotFoundError:
+        if problems is not None:
+            problems.append(_PING_FEHLT)  # Dubletten entfernt scan() am Ende
+    return tcp_reachable(ip)
 
 
 # ---------------------------------------------------------------------------
@@ -240,20 +333,6 @@ def probe(ip: str, timeout: float = 1.0) -> bool:
 # ---------------------------------------------------------------------------
 
 _MAC_RE = re.compile(r"([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})")
-
-# Als gebaute .app (von Finder/LaunchServices statt Terminal gestartet) fehlt
-# oft /usr/sbin im PATH, wodurch "arp" per subprocess nicht gefunden wird
-# (ping/TCP-Probes finden trotzdem Geräte -> nur die MAC bleibt dann leer).
-# Deshalb feste Pfade zuerst versuchen, "arp" über PATH nur als Rückfall.
-_ARP_CANDIDATES = ["/usr/sbin/arp", "/sbin/arp", "arp"]
-
-
-def _arp_binary() -> str:
-    for path in _ARP_CANDIDATES:
-        if "/" not in path or os.path.exists(path):
-            return path
-    return "arp"
-
 
 def normalize_mac(mac: str) -> str:
     parts = mac.split(":")
@@ -283,20 +362,31 @@ def parse_arp_output(out: str, windows: bool) -> Dict[str, str]:
     return table
 
 
-def read_arp_table() -> Dict[str, str]:
+def _programmfehler(was: str, prog: str, e: BaseException) -> str:
+    """Kurzer deutscher Hinweis für last_problems."""
+    if isinstance(e, subprocess.TimeoutExpired):
+        return f"{was}: {prog} antwortet nicht"
+    if isinstance(e, FileNotFoundError):
+        return f"{was}: {prog} nicht gefunden"
+    return f"{was}: {prog} fehlgeschlagen ({e})"
+
+
+def read_arp_table(problems: Optional[List[str]] = None) -> Dict[str, str]:
     """Liest die ARP-Tabelle des Systems -> {ip: mac}.
 
     macOS/Linux: 'arp -an' – OHNE -n löst arp jeden Eintrag per DNS auf; in Praxisnetzen
     mit vielen Geräten dauerte das länger als das Timeout, die Tabelle kam leer zurück und
     KEIN Gerät bekam eine MAC. Ausgabe als Bytes lesen und tolerant dekodieren
-    (Windows-Konsole nutzt die OEM-Codepage) – ein Dekodierfehler leerte sonst ebenfalls alles."""
-    windows = platform.system().lower() == "windows"
-    cmd = ["arp", "-a"] if windows else [_arp_binary(), "-an"]
+    (Windows-Konsole nutzt die OEM-Codepage) – ein Dekodierfehler leerte sonst ebenfalls alles.
+    Fehler (Timeout, Programm fehlt) landen in `problems` statt still {}."""
+    cmd = [ARP, "-a"] if WINDOWS else [ARP, "-an"]
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, **NO_WINDOW).stdout
-    except Exception:
+    except (OSError, subprocess.SubprocessError) as e:
+        if problems is not None:
+            problems.append(_programmfehler("MAC-Adressen nicht lesbar", "arp", e))
         return {}
-    return parse_arp_output(out.decode("latin-1"), windows)
+    return parse_arp_output(out.decode("latin-1"), WINDOWS)
 
 
 def _arp_anstossen(ip: str):
@@ -308,11 +398,12 @@ def _arp_anstossen(ip: str):
         pass
 
 
-def read_arp_for(ips: List[str], local_net: Optional[ipaddress.IPv4Network], versuche: int = 3) -> Dict[str, str]:
+def read_arp_for(ips: List[str], local_net: Optional[ipaddress.IPv4Network], versuche: int = 3,
+                 problems: Optional[List[str]] = None) -> Dict[str, str]:
     """ARP-Tabelle lesen; fehlen Geräte aus dem eigenen Subnetz, ARP für sie neu anstoßen
     und erneut lesen (Einträge können zwischen Ping und Auslesen schon verfallen sein,
     unter Windows z. B. nach ~30 s)."""
-    table = read_arp_table()
+    table = read_arp_table(problems)
     for _ in range(versuche - 1):
         fehlend = [ip for ip in ips if ip not in table and local_net is not None
                    and ipaddress.ip_address(ip) in local_net]
@@ -321,35 +412,69 @@ def read_arp_for(ips: List[str], local_net: Optional[ipaddress.IPv4Network], ver
         for ip in fehlend:
             _arp_anstossen(ip)
         time.sleep(1.0)
-        table.update(read_arp_table())
+        table.update(read_arp_table(problems))
     return table
 
 
-def own_mac(ip: str) -> str:
-    """MAC der eigenen Netzwerkkarte zur IP (steht nie in der eigenen ARP-Tabelle)."""
+def own_interface(ip: str, problems: Optional[List[str]] = None) -> Tuple[str, Optional[int]]:
+    """(MAC, Präfixlänge) der eigenen Netzwerkkarte mit dieser IP. Die eigene MAC steht nie
+    in der eigenen ARP-Tabelle. Präfix None = nicht ermittelbar. Unter Windows MAC und
+    Präfix in EINEM PowerShell-Aufruf (Start dauert 1–3 s, läuft parallel zum ARP-Lesen)."""
     try:
-        if platform.system().lower() == "windows":
-            ps = ("(Get-NetAdapter -InterfaceIndex (Get-NetIPAddress -IPAddress '%s' -ErrorAction Stop)"
-                  ".InterfaceIndex).MacAddress" % ip)
-            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, **NO_WINDOW).stdout
-            m = re.search(r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", out.decode("latin-1"))
-            return normalize_mac(m.group(1).replace("-", ":")) if m else ""
-        ifconfig = "/sbin/ifconfig" if os.path.exists("/sbin/ifconfig") else "ifconfig"
-        out = subprocess.run([ifconfig], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout.decode("latin-1")
-        return parse_ifconfig_mac(out, ip)
-    except Exception:
-        return ""
+        ip = str(ipaddress.IPv4Address(ip))  # nur geprüfte IP in den PowerShell-Befehl
+    except ValueError:
+        return "", None
+    try:
+        if WINDOWS:
+            ps = ("$a = Get-NetIPAddress -IPAddress '%s' -ErrorAction Stop | Select-Object -First 1; "
+                  "(Get-NetAdapter -InterfaceIndex $a.InterfaceIndex).MacAddress; "
+                  "'PREFIX=' + $a.PrefixLength" % ip)
+            out = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", ps],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8,
+                                 **NO_WINDOW).stdout.decode("latin-1")
+            m = re.search(r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", out)
+            p = re.search(r"PREFIX=(\d+)", out)
+            return (normalize_mac(m.group(1).replace("-", ":")) if m else "",
+                    int(p.group(1)) if p else None)
+        out = subprocess.run([IFCONFIG], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=10).stdout.decode("latin-1")
+        return parse_ifconfig(out, ip)
+    except (OSError, subprocess.SubprocessError) as e:
+        if problems is not None:
+            problems.append(_programmfehler("Eigene MAC nicht lesbar",
+                                            "PowerShell" if WINDOWS else "ifconfig", e))
+        return "", None
+
+
+def own_mac(ip: str) -> str:
+    """MAC der eigenen Netzwerkkarte zur IP."""
+    return own_interface(ip)[0]
+
+
+def _praefix(maske: str) -> Optional[int]:
+    """'0xffffff00' (macOS) oder '255.255.255.0' (Linux) -> 24."""
+    try:
+        wert = int(maske, 16) if maske.lower().startswith("0x") else int(ipaddress.IPv4Address(maske))
+    except ValueError:
+        return None
+    return bin(wert).count("1")
+
+
+def parse_ifconfig(out: str, ip: str) -> Tuple[str, Optional[int]]:
+    """Sucht in 'ifconfig'-Ausgabe die Schnittstelle mit dieser IPv4 -> (MAC, Präfixlänge)."""
+    for block in re.split(r"\n(?=\S)", out):
+        zeile = re.search(r"\binet (?:addr:)?%s\b[^\n]*" % re.escape(ip), block)
+        if zeile:
+            m = re.search(r"\b(?:ether|HWaddr)\s+([0-9a-fA-F:]{11,17})", block)
+            nm = re.search(r"(?:netmask|Mask:)\s*(0x[0-9a-fA-F]{8}|\d+\.\d+\.\d+\.\d+)", zeile.group(0))
+            return (normalize_mac(m.group(1)) if m else "",
+                    _praefix(nm.group(1)) if nm else None)
+    return "", None
 
 
 def parse_ifconfig_mac(out: str, ip: str) -> str:
     """Sucht in 'ifconfig'-Ausgabe die Schnittstelle mit dieser IPv4 und liefert ihre MAC."""
-    for block in re.split(r"\n(?=\S)", out):
-        if re.search(r"\binet (?:addr:)?%s\b" % re.escape(ip), block):
-            m = re.search(r"\b(?:ether|HWaddr)\s+([0-9a-fA-F:]{11,17})", block)
-            if m:
-                return normalize_mac(m.group(1))
-    return ""
+    return parse_ifconfig(out, ip)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +536,7 @@ def _dns_read_name(data: bytes, offset: int):
             jumped = True
             continue
         offset += 1
-        labels.append(data[offset:offset + length].decode("latin-1", "ignore"))
+        labels.append(data[offset:offset + length].decode("utf-8", "replace"))  # Bonjour-Namen sind UTF-8
         offset += length
     return ".".join(labels), end
 
@@ -481,7 +606,7 @@ def mdns_name(ip: str, timeout: float = 1.0) -> str:
 
 
 def netbios_name(ip: str, timeout: float = 1.0) -> str:
-    """Fragt den NetBIOS-Namen (NBSTAT) per UDP/137 ab – für Windows-Geräte.
+    """Fragt den NetBIOS-Namen (NBSTAT) per UDP/137 ab – Windows-Geräte und Samba.
 
     Keine Antwort (Timeout, z.B. bei jedem Nicht-Windows-Gerät) ist normal
     und liefert "". Andere Exceptions werden bewusst propagiert.
@@ -499,22 +624,28 @@ def netbios_name(ip: str, timeout: float = 1.0) -> str:
             data, _ = sock.recvfrom(1024)
         except (socket.timeout, ConnectionResetError):
             return ""  # keine Antwort (Windows: ICMP port unreachable) - normal, kein Fehler
-        if len(data) < 57:
-            return ""
-        num_names = data[56]
-        offset = 57
-        for _ in range(num_names):
-            if offset + 18 > len(data):
-                break
-            name = data[offset:offset + 15].decode("ascii", "ignore").strip()
-            flags = data[offset + 16]  # Byte 15 ist das Suffix, 16/17 die Flags
-            offset += 18
-            # Unique + kein Gruppenname -> Rechnername
-            if flags & 0x80 == 0 and name and name != "__MSBROWSE__":
-                return name
-        return ""
+        return parse_nbstat(data)
     finally:
         sock.close()
+
+
+def parse_nbstat(data: bytes) -> str:
+    """Rechnername aus einer NBSTAT-Antwort (ohne Socket, für Tests). "" wenn keiner drin.
+    Antwort beantwortet auch Samba (NAS, Mac, Linux) – daher KEIN Rückschluss auf Windows."""
+    if len(data) < 57:
+        return ""
+    num_names = data[56]
+    offset = 57
+    for _ in range(num_names):
+        if offset + 18 > len(data):
+            break
+        name = data[offset:offset + 15].decode("ascii", "ignore").strip()
+        flags = data[offset + 16]  # Byte 15 ist das Suffix, 16/17 die Flags
+        offset += 18
+        # Unique + kein Gruppenname -> Rechnername
+        if flags & 0x80 == 0 and name and name != "__MSBROWSE__":
+            return name
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -571,27 +702,59 @@ def grab_banner(ip: str, port: int, timeout: float = 1.0) -> str:
 ProgressCb = Optional[Callable[[float, str], None]]
 
 
+# Bekannte lokal verwaltete MAC-Präfixe, die KEINE zufälligen Handy-Adressen sind.
+_VM_PRAEFIXE = (
+    ("52:54:00", "Virtuelle Maschine (QEMU/KVM)"),
+    ("02:42:", "Docker-Container"),
+)
+_MAC_DOPPELT = "MAC mehrfach vergeben (Repeater/Proxy-ARP?)"
+
+
+def vendor_for_mac(mac: str) -> str:
+    """Hersteller zur MAC; ohne OUI-Treffer VM-Präfix bzw. „Private MAC (zufällig)“."""
+    vendor = lookup_vendor(mac)
+    if vendor:
+        return vendor
+    for praefix, name in _VM_PRAEFIXE:
+        if mac.startswith(praefix):
+            return name
+    if int(mac[1], 16) & 2:  # „lokal verwaltet“-Bit: Handy/Tablet mit privater WLAN-Adresse
+        return "Private MAC (zufällig)"
+    return ""
+
+
 class Scanner:
     def __init__(self, config: Optional[ScanConfig] = None):
         self.config = config or ScanConfig()
         self._cancel = threading.Event()
+        self.last_problems: List[str] = []  # Hinweise des letzten Scans (für die GUI)
+        self.cancelled = False              # True = letzter Scan wurde abgebrochen
 
     def cancel(self):
         self._cancel.set()
 
     def reset(self):
         self._cancel.clear()
+        self.cancelled = False
+        self.last_problems = []
 
     def _report(self, cb: ProgressCb, frac: float, msg: str):
         if cb:
             cb(frac, msg)
 
+    def _abbrechen(self, ex: concurrent.futures.Executor):
+        self._cancel.set()
+        ex.shutdown(wait=False, cancel_futures=True)
+
     def scan(self, cidr: str, progress: ProgressCb = None,
              on_host: Optional[Callable[[Host], None]] = None) -> List[Host]:
+        """Scannt das Netz. ValueError (deutscher Text) bei ungültigem/zu großem Netz.
+        Nach dem Scan: self.last_problems (Hinweise), self.cancelled."""
         self.reset()
         cfg = self.config
         targets = hosts_in_network(cidr)
         total = len(targets)
+        problems = self.last_problems
         self._report(progress, 0.0, f"Starte Ping-Sweep über {total} Adressen …")
 
         # --- Phase 1: Aktive Erreichbarkeitsprüfung (parallel) ------------
@@ -600,50 +763,70 @@ class Scanner:
         # ARP-Cache-Einträge. Funktioniert auch netzübergreifend über Router.
         alive: List[str] = []
         done = 0
+        fehlgeschlagen = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.max_workers) as ex:
-            futures = {ex.submit(probe, ip, cfg.ping_timeout): ip for ip in targets}
-            for fut in concurrent.futures.as_completed(futures):
-                if self._cancel.is_set():
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    break
-                ip = futures[fut]
-                done += 1
-                try:
-                    if fut.result():
-                        alive.append(ip)
-                except Exception:
-                    pass
-                self._report(progress, 0.4 * done / max(total, 1),
-                             f"Prüfe {done}/{total} – {len(alive)} erreichbar")
+            try:
+                futures = {ex.submit(probe, ip, cfg.ping_timeout, problems): ip for ip in targets}
+                for fut in concurrent.futures.as_completed(futures):
+                    if self._cancel.is_set():
+                        self._abbrechen(ex)
+                        break
+                    ip = futures[fut]
+                    done += 1
+                    try:
+                        if fut.result():
+                            alive.append(ip)
+                    except Exception:  # z. B. EMFILE: Adresse nicht prüfbar - zählen statt verschweigen
+                        fehlgeschlagen += 1
+                    self._report(progress, 0.4 * done / max(total, 1),
+                                 f"Prüfe {done}/{total} – {len(alive)} erreichbar")
+            except BaseException:  # Strg+C o. Ä.: Rest nicht mehr starten
+                self._abbrechen(ex)
+                raise
+        if fehlgeschlagen:
+            problems.append(f"{fehlgeschlagen} Adressen konnten nicht geprüft werden (Systemfehler)")
 
         if self._cancel.is_set():
+            self.last_problems[:] = list(dict.fromkeys(problems))
+            self.cancelled = True
             return []
 
+        # Eigene IP/Karte FÜR DIESES NETZ (nicht Default-Route – wichtig bei VPN/mehreren Karten).
         # ARP-Tabelle NUR zur MAC-/Hersteller-Zuordnung der erreichbaren Geräte
         # (nur im selben Subnetz verfügbar; sonst bleibt die MAC leer).
-        own = get_local_ip()
-        try:
-            local_net = ipaddress.ip_network(f"{own}/24", strict=False)  # ponytail: /24 angenommen; reicht fürs Nachfassen
-            scan_net = ipaddress.ip_network(cidr, strict=False)
-            local_net = scan_net if ipaddress.ip_address(own) in scan_net else local_net
-        except ValueError:
-            local_net = None
+        scan_net = ipaddress.ip_network(cidr.strip(), strict=False)
+        own = local_ip_for(targets[0]) if targets else ""
+        if not own:
+            problems.append("Eigene Netzwerkkarte für dieses Netz nicht ermittelbar")
         self._report(progress, 0.4, "Lese MAC-Adressen …")
-        arp = read_arp_for(alive, local_net)
-        if own in targets:
-            mac = own_mac(own)
-            if mac:
-                arp[own] = mac
+        local_net = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            eigen = ex.submit(own_interface, own, problems) if own else None
+            if own and ipaddress.ip_address(own) in scan_net:
+                local_net = scan_net  # nicht auf PowerShell warten
+            elif eigen:
+                praefix = eigen.result()[1] or 24
+                local_net = ipaddress.ip_network(f"{own}/{praefix}", strict=False)
+            arp = read_arp_for(alive, local_net, problems=problems)
+            mac = eigen.result()[0] if eigen else ""
+        if own in targets and mac:
+            arp[own] = mac
 
         # Eigene IP immer aufnehmen
         if own not in alive and own in targets:
             alive.append(own)
         alive = sorted(set(alive), key=lambda x: int(ipaddress.ip_address(x)))
+
+        # Gleiche MAC bei mehreren IPs (Repeater/Proxy-ARP): Hersteller wäre geraten/falsch.
+        zaehler: Dict[str, int] = {}
+        for ip in alive:
+            if arp.get(ip):
+                zaehler[arp[ip]] = zaehler.get(arp[ip], 0) + 1
+        doppelt = {m for m, n in zaehler.items() if n > 1}
         self._report(progress, 0.4, f"{len(alive)} Geräte erreichbar – ermittle Details …")
 
         # --- Phase 2: Details je Host (parallel) --------------------------
         hosts: List[Host] = []
-        lock = threading.Lock()
         n_alive = len(alive)
         done = 0
 
@@ -652,22 +835,27 @@ class Scanner:
             if self._cancel.is_set():
                 return h
             h.mac = arp.get(ip, "")
-            if h.mac:
-                h.vendor = lookup_vendor(h.mac)
-                if not h.vendor and int(h.mac[1], 16) & 2:  # „lokal verwaltet“-Bit: Handy/Tablet mit privater WLAN-Adresse
-                    h.vendor = "Private MAC (zufällig)"
-            # Namen: Reverse-DNS -> mDNS/Bonjour -> NetBIOS
-            try:
-                h.hostname = reverse_dns(ip)
-                if not h.hostname:
-                    h.hostname = mdns_name(ip, cfg.ping_timeout)
-                if not h.hostname:
-                    nb = netbios_name(ip, cfg.ping_timeout)
-                    if nb:
-                        h.hostname = nb
-                        h.os_hint = "Windows"
-            except Exception:
-                h.scan_warning = _add_warning(h.scan_warning, "Namensauflösung fehlgeschlagen")
+            if h.mac in doppelt:
+                h.scan_warning = _add_warning(h.scan_warning, _MAC_DOPPELT)
+                if ip == own:
+                    h.vendor = vendor_for_mac(h.mac)  # eigene MAC kommt sicher von der eigenen Karte
+            elif h.mac:
+                h.vendor = vendor_for_mac(h.mac)
+            # Namen: Reverse-DNS -> mDNS/Bonjour -> NetBIOS; jeder Resolver einzeln,
+            # ein Fehler in einem verhindert die anderen nicht.
+            fehler = []
+            for name, frage in (("DNS", lambda: reverse_dns(ip)),
+                                ("mDNS", lambda: mdns_name(ip, cfg.ping_timeout)),
+                                ("NetBIOS", lambda: netbios_name(ip, cfg.ping_timeout))):
+                if h.hostname:
+                    break
+                try:
+                    h.hostname = frage()
+                except Exception:
+                    fehler.append(name)
+            if fehler:
+                h.scan_warning = _add_warning(h.scan_warning,
+                                              f"Namensauflösung fehlgeschlagen ({', '.join(fehler)})")
             # Ports
             try:
                 for port in cfg.ports:
@@ -687,27 +875,33 @@ class Scanner:
             return h
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(cfg.max_workers, 64)) as ex:
-            futures = {ex.submit(enrich, ip): ip for ip in alive}
-            for fut in concurrent.futures.as_completed(futures):
-                if self._cancel.is_set():
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    break
-                done += 1
-                try:
-                    h = fut.result()
-                except Exception:
-                    h = Host(ip=futures[fut],
-                              scan_warning="Scan fehlgeschlagen (unerwarteter Fehler)")
-                with lock:
+            try:
+                futures = {ex.submit(enrich, ip): ip for ip in alive}
+                for fut in concurrent.futures.as_completed(futures):
+                    if self._cancel.is_set():
+                        self._abbrechen(ex)
+                        break
+                    done += 1
+                    try:
+                        h = fut.result()
+                    except Exception:
+                        h = Host(ip=futures[fut],
+                                 scan_warning="Scan fehlgeschlagen (unerwarteter Fehler)")
                     hosts.append(h)
-                if on_host:
-                    on_host(h)
-                self._report(progress, 0.4 + 0.6 * done / max(n_alive, 1),
-                             f"Details {done}/{n_alive} – {h.ip}")
+                    if on_host:
+                        on_host(h)
+                    self._report(progress, 0.4 + 0.6 * done / max(n_alive, 1),
+                                 f"Details {done}/{n_alive} – {h.ip}")
+            except BaseException:
+                self._abbrechen(ex)
+                raise
 
         hosts.sort(key=lambda x: x.sort_key())
+        self.last_problems[:] = list(dict.fromkeys(problems))  # Dubletten raus (z. B. ping fehlt)
+        hinweis = (" Hinweis: " + "; ".join(self.last_problems)) if self.last_problems else ""
         if self._cancel.is_set():
-            self._report(progress, 1.0, f"Abgebrochen – {len(hosts)} Geräte (unvollständig).")
+            self.cancelled = True
+            self._report(progress, 1.0, f"Abgebrochen – {len(hosts)} Geräte (unvollständig).{hinweis}")
         else:
-            self._report(progress, 1.0, f"Fertig – {len(hosts)} Geräte.")
+            self._report(progress, 1.0, f"Fertig – {len(hosts)} Geräte.{hinweis}")
         return hosts
