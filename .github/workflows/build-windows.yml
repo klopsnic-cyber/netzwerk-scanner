@@ -36,6 +36,11 @@ jobs:
           pip install -r requirements.txt
           pip install pillow
 
+      - name: MAC-Auswertung auf echtem Windows prüfen
+        run: |
+          python tests/selbsttest_mac.py
+          python -c "from netzwerkscanner.scanner import read_arp_table, own_mac, get_local_ip; ip=get_local_ip(); t=read_arp_table(); m=own_mac(ip); print('eigene IP', ip, 'MAC', m, '| ARP-Einträge', len(t)); assert m, 'eigene MAC fehlt'; assert t, 'ARP-Tabelle leer'"
+
       - name: Icon erzeugen
         run: python assets/make_icon.py assets
 

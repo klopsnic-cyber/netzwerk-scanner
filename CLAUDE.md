@@ -144,6 +144,22 @@ NetzwerkScanner.spec       PyInstaller-Konfiguration
     Browser) - das Ersetzen einer laufenden `.exe` ist unter Windows riskanter
     als unter POSIX (Windows sperrt offene Dateien).
 
+14. **MAC-Adressen: `arp -an`, nie `arp -a` (macOS/Linux).** Ohne `-n` löst arp jeden
+    Eintrag per DNS auf; in Netzen ohne PTR-Einträge dauerte das länger als das
+    Timeout → leere Tabelle → KEIN Gerät hatte eine MAC (v1.3.0, reproduziert:
+    22/22 ohne MAC). Ausgabe als Bytes lesen und `latin-1` dekodieren (Windows-Konsole
+    = OEM-Codepage, ein Dekodierfehler leerte sonst ebenfalls alles). Fehlende
+    Geräte aus dem eigenen Subnetz werden per UDP-Paket neu „angestoßen“ und die
+    Tabelle bis zu 3× gelesen (`read_arp_for`); die eigene MAC kommt aus
+    `ifconfig` bzw. PowerShell `Get-NetAdapter` (`own_mac`). Selbsttest:
+    `tests/selbsttest_mac.py`, läuft auch im Windows-Build auf GitHub mit echter
+    ARP-Abfrage.
+
+15. **Reverse-DNS nur per `getnameinfo` mit 3-s-Limit, nie `gethostbyaddr`.**
+    `gethostbyaddr` läuft auf macOS hinter einer globalen Sperre (seriell) und
+    wartet ohne PTR ~30 s pro Gerät → Scan mit 22 Geräten über 13 Minuten.
+    Mit `getnameinfo` in einem Hilfsthread: gleiches Netz in 37 s.
+
 ## Eingebettete Daten neu erzeugen
 - OUI: `python3 assets/make_oui_data.py` (nach Aktualisieren von `data/oui.csv`)
 - Vorlage: aus data/Netzwerkdoku-Vorlage.xlsx per base64 nach template_data.py

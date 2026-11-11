@@ -262,40 +262,119 @@ def normalize_mac(mac: str) -> str:
     return ":".join(p.zfill(2).upper() for p in parts)
 
 
-def read_arp_table() -> Dict[str, str]:
-    """Liest die ARP-Tabelle des Systems -> {ip: mac}."""
+_UNGUELTIGE_MACS = {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}
+
+
+def parse_arp_output(out: str, windows: bool) -> Dict[str, str]:
+    """Wertet die Ausgabe von 'arp -a' (Windows) bzw. 'arp -an' (macOS/Linux) aus -> {ip: mac}."""
     table: Dict[str, str] = {}
-    system = platform.system().lower()
-    try:
-        if system == "windows":
-            out = subprocess.run(["arp", "-a"], capture_output=True, text=True, timeout=10, **NO_WINDOW).stdout
-            for line in out.splitlines():
-                m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})", line)
-                if m:
-                    table[m.group(1)] = normalize_mac(m.group(2).replace("-", ":"))
+    for line in out.splitlines():
+        if windows:
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", line)
+            ip, mac = (m.group(1), m.group(2).replace("-", ":")) if m else (None, None)
         else:
-            out = subprocess.run([_arp_binary(), "-a"], capture_output=True, text=True, timeout=10, **NO_WINDOW).stdout
-            for line in out.splitlines():
-                ipm = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)", line)
-                macm = _MAC_RE.search(line)
-                if ipm and macm and "incomplete" not in line.lower():
-                    table[ipm.group(1)] = normalize_mac(macm.group(1))
-    except Exception:
-        pass
+            ipm = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)", line)
+            macm = _MAC_RE.search(line)
+            ip, mac = (ipm.group(1), macm.group(1)) if ipm and macm and "incomplete" not in line.lower() else (None, None)
+        if ip:
+            mac = normalize_mac(mac)
+            if mac not in _UNGUELTIGE_MACS:
+                table[ip] = mac
     return table
+
+
+def read_arp_table() -> Dict[str, str]:
+    """Liest die ARP-Tabelle des Systems -> {ip: mac}.
+
+    macOS/Linux: 'arp -an' – OHNE -n löst arp jeden Eintrag per DNS auf; in Praxisnetzen
+    mit vielen Geräten dauerte das länger als das Timeout, die Tabelle kam leer zurück und
+    KEIN Gerät bekam eine MAC. Ausgabe als Bytes lesen und tolerant dekodieren
+    (Windows-Konsole nutzt die OEM-Codepage) – ein Dekodierfehler leerte sonst ebenfalls alles."""
+    windows = platform.system().lower() == "windows"
+    cmd = ["arp", "-a"] if windows else [_arp_binary(), "-an"]
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, **NO_WINDOW).stdout
+    except Exception:
+        return {}
+    return parse_arp_output(out.decode("latin-1"), windows)
+
+
+def _arp_anstossen(ip: str):
+    """Löst eine ARP-Auflösung aus, ohne auf Antwort zu warten (UDP-Paket an den Discard-Port)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(b"", (ip, 9))
+    except OSError:
+        pass
+
+
+def read_arp_for(ips: List[str], local_net: Optional[ipaddress.IPv4Network], versuche: int = 3) -> Dict[str, str]:
+    """ARP-Tabelle lesen; fehlen Geräte aus dem eigenen Subnetz, ARP für sie neu anstoßen
+    und erneut lesen (Einträge können zwischen Ping und Auslesen schon verfallen sein,
+    unter Windows z. B. nach ~30 s)."""
+    table = read_arp_table()
+    for _ in range(versuche - 1):
+        fehlend = [ip for ip in ips if ip not in table and local_net is not None
+                   and ipaddress.ip_address(ip) in local_net]
+        if not fehlend:
+            break
+        for ip in fehlend:
+            _arp_anstossen(ip)
+        time.sleep(1.0)
+        table.update(read_arp_table())
+    return table
+
+
+def own_mac(ip: str) -> str:
+    """MAC der eigenen Netzwerkkarte zur IP (steht nie in der eigenen ARP-Tabelle)."""
+    try:
+        if platform.system().lower() == "windows":
+            ps = ("(Get-NetAdapter -InterfaceIndex (Get-NetIPAddress -IPAddress '%s' -ErrorAction Stop)"
+                  ".InterfaceIndex).MacAddress" % ip)
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, **NO_WINDOW).stdout
+            m = re.search(r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", out.decode("latin-1"))
+            return normalize_mac(m.group(1).replace("-", ":")) if m else ""
+        ifconfig = "/sbin/ifconfig" if os.path.exists("/sbin/ifconfig") else "ifconfig"
+        out = subprocess.run([ifconfig], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10).stdout.decode("latin-1")
+        return parse_ifconfig_mac(out, ip)
+    except Exception:
+        return ""
+
+
+def parse_ifconfig_mac(out: str, ip: str) -> str:
+    """Sucht in 'ifconfig'-Ausgabe die Schnittstelle mit dieser IPv4 und liefert ihre MAC."""
+    for block in re.split(r"\n(?=\S)", out):
+        if re.search(r"\binet (?:addr:)?%s\b" % re.escape(ip), block):
+            m = re.search(r"\b(?:ether|HWaddr)\s+([0-9a-fA-F:]{11,17})", block)
+            if m:
+                return normalize_mac(m.group(1))
+    return ""
 
 
 # ---------------------------------------------------------------------------
 # Namensauflösung
 # ---------------------------------------------------------------------------
 
-def reverse_dns(ip: str) -> str:
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except (socket.herror, socket.gaierror):
-        return ""  # kein PTR-Eintrag - normal, kein Fehler
-    # andere Exceptions (z.B. DNS-Resolver nicht erreichbar) bewusst nicht
-    # geschluckt - Aufrufer wertet das als echten Fehlschlag.
+def reverse_dns(ip: str, timeout: float = 3.0) -> str:
+    """PTR-Name zur IP, höchstens `timeout` Sekunden.
+
+    Nicht socket.gethostbyaddr: das läuft auf macOS hinter einer globalen Sperre (nacheinander)
+    und wartet ohne PTR-Eintrag ~30 s – bei 22 Geräten dauerte ein Scan so über 13 Minuten.
+    getnameinfo läuft parallel; hängt der Resolver, geben wir nach `timeout` auf
+    (der Hilfsthread endet von selbst, sobald der Resolver antwortet)."""
+    ergebnis = [""]
+
+    def frage():
+        try:
+            ergebnis[0] = socket.getnameinfo((ip, 0), socket.NI_NAMEREQD)[0]
+        except OSError:
+            pass  # kein PTR-Eintrag - normal, kein Fehler
+
+    t = threading.Thread(target=frage, daemon=True)
+    t.start()
+    t.join(timeout)
+    return ergebnis[0]
 
 
 # --- mDNS / Bonjour (.local-Namen) ----------------------------------------
@@ -542,10 +621,21 @@ class Scanner:
 
         # ARP-Tabelle NUR zur MAC-/Hersteller-Zuordnung der erreichbaren Geräte
         # (nur im selben Subnetz verfügbar; sonst bleibt die MAC leer).
-        arp = read_arp_table()
+        own = get_local_ip()
+        try:
+            local_net = ipaddress.ip_network(f"{own}/24", strict=False)  # ponytail: /24 angenommen; reicht fürs Nachfassen
+            scan_net = ipaddress.ip_network(cidr, strict=False)
+            local_net = scan_net if ipaddress.ip_address(own) in scan_net else local_net
+        except ValueError:
+            local_net = None
+        self._report(progress, 0.4, "Lese MAC-Adressen …")
+        arp = read_arp_for(alive, local_net)
+        if own in targets:
+            mac = own_mac(own)
+            if mac:
+                arp[own] = mac
 
         # Eigene IP immer aufnehmen
-        own = get_local_ip()
         if own not in alive and own in targets:
             alive.append(own)
         alive = sorted(set(alive), key=lambda x: int(ipaddress.ip_address(x)))
@@ -564,6 +654,8 @@ class Scanner:
             h.mac = arp.get(ip, "")
             if h.mac:
                 h.vendor = lookup_vendor(h.mac)
+                if not h.vendor and int(h.mac[1], 16) & 2:  # „lokal verwaltet“-Bit: Handy/Tablet mit privater WLAN-Adresse
+                    h.vendor = "Private MAC (zufällig)"
             # Namen: Reverse-DNS -> mDNS/Bonjour -> NetBIOS
             try:
                 h.hostname = reverse_dns(ip)
